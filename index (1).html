@@ -1,0 +1,2278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>NeuroTransformer — EEG Testing Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Syne:wght@400;500;700;800&display=swap" rel="stylesheet"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  :root {
+    --bg:       #070b0f;
+    --bg2:      #0d1318;
+    --bg3:      #111820;
+    --border:   #1e2d3d;
+    --border2:  #2a3f55;
+    --text:     #c8d8e8;
+    --muted:    #4a6a88;
+    --accent:   #00d4ff;
+    --ictal:    #ff4d6d;
+    --inter:    #00e5a0;
+    --warn:     #ffb700;
+    --font-mono: 'JetBrains Mono', monospace;
+    --font-display: 'Syne', sans-serif;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-mono);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Scanline overlay */
+  body::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: repeating-linear-gradient(
+      0deg, transparent, transparent 2px,
+      rgba(0,0,0,0.03) 2px, rgba(0,0,0,0.03) 4px
+    );
+    pointer-events: none;
+    z-index: 1000;
+  }
+
+  /* ── Header ── */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 1rem 2rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg2);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+  .logo {
+    font-family: var(--font-display);
+    font-size: 1.1rem;
+    font-weight: 800;
+    letter-spacing: .02em;
+    color: #fff;
+    display: flex;
+    align-items: center;
+    gap: .6rem;
+  }
+  .logo-pulse {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0%,100% { opacity: 1; box-shadow: 0 0 0 0 rgba(0,212,255,.4); }
+    50%      { opacity: .7; box-shadow: 0 0 0 6px rgba(0,212,255,0); }
+  }
+  .header-meta {
+    display: flex;
+    gap: 1.5rem;
+    font-size: .7rem;
+    color: var(--muted);
+  }
+  .header-meta span { display: flex; align-items: center; gap: .4rem; }
+  .status-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--inter);
+    animation: pulse 2s infinite;
+  }
+
+  /* ── Layout ── */
+  .main { display: grid; grid-template-columns: 280px 1fr; min-height: calc(100vh - 57px); }
+
+  /* ── Sidebar ── */
+  aside {
+    background: var(--bg2);
+    border-right: 1px solid var(--border);
+    padding: 1.5rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+  }
+  .section-title {
+    font-size: .65rem;
+    font-weight: 700;
+    letter-spacing: .12em;
+    color: var(--muted);
+    text-transform: uppercase;
+    padding-bottom: .5rem;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: .75rem;
+  }
+  .control-group { margin-bottom: .75rem; }
+  .control-label {
+    font-size: .7rem;
+    color: var(--muted);
+    margin-bottom: .3rem;
+    display: flex;
+    justify-content: space-between;
+  }
+  .control-label span { color: var(--accent); }
+  input[type=range] {
+    width: 100%;
+    -webkit-appearance: none;
+    height: 3px;
+    background: var(--border);
+    border-radius: 2px;
+    outline: none;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    border: 2px solid var(--bg);
+  }
+  select {
+    width: 100%;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: .4rem .6rem;
+    font-family: var(--font-mono);
+    font-size: .75rem;
+    border-radius: 4px;
+    outline: none;
+    cursor: pointer;
+  }
+  select:focus { border-color: var(--accent); }
+
+  .btn {
+    width: 100%;
+    padding: .6rem;
+    border: 1px solid var(--border2);
+    background: var(--bg3);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: .75rem;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all .15s;
+    text-align: center;
+    margin-bottom: .5rem;
+  }
+  .btn:hover { background: var(--border); border-color: var(--accent); color: var(--accent); }
+  .btn.primary {
+    background: rgba(0,212,255,.08);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .btn.primary:hover { background: rgba(0,212,255,.18); }
+  .btn.danger {
+    background: rgba(255,77,109,.08);
+    border-color: var(--ictal);
+    color: var(--ictal);
+  }
+
+  .channel-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+  }
+  .ch-badge {
+    font-size: .6rem;
+    padding: 3px 5px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    color: var(--muted);
+    text-align: center;
+    cursor: pointer;
+    transition: all .15s;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .ch-badge.active { border-color: var(--accent); color: var(--accent); background: rgba(0,212,255,.07); }
+  .ch-badge.hot    { border-color: var(--ictal);  color: var(--ictal);  background: rgba(255,77,109,.07); animation: hotpulse 1s infinite; }
+  @keyframes hotpulse { 0%,100%{opacity:1} 50%{opacity:.6} }
+
+  /* ── Main content ── */
+  .content { display: flex; flex-direction: column; overflow: hidden; }
+
+  /* ── EEG Viewer ── */
+  .eeg-panel {
+    flex: 1;
+    padding: 1.5rem 2rem 1rem;
+    border-bottom: 1px solid var(--border);
+    min-height: 320px;
+  }
+  .panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+  }
+  .panel-title {
+    font-family: var(--font-display);
+    font-size: .85rem;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: .03em;
+  }
+  .panel-tag {
+    font-size: .65rem;
+    padding: 2px 8px;
+    border-radius: 3px;
+    background: rgba(0,212,255,.1);
+    border: 1px solid rgba(0,212,255,.3);
+    color: var(--accent);
+  }
+  canvas { width: 100%; display: block; }
+  #eeg-canvas { border-radius: 4px; background: var(--bg3); }
+
+  /* ── Bottom panels ── */
+  .bottom { display: grid; grid-template-columns: 1fr 1fr 1fr; border-top: 1px solid var(--border); }
+  .sub-panel {
+    padding: 1.25rem 1.5rem;
+    border-right: 1px solid var(--border);
+  }
+  .sub-panel:last-child { border-right: none; }
+
+  /* Prediction display */
+  .pred-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: .5rem;
+    padding: .5rem 1rem;
+    border-radius: 6px;
+    font-family: var(--font-display);
+    font-size: 1.4rem;
+    font-weight: 800;
+    margin: .5rem 0;
+    transition: all .3s;
+  }
+  .pred-badge.ictal      { background: rgba(255,77,109,.12); color: var(--ictal); border: 1px solid rgba(255,77,109,.3); }
+  .pred-badge.interictal { background: rgba(0,229,160,.1);  color: var(--inter); border: 1px solid rgba(0,229,160,.25); }
+  .pred-badge.idle       { background: var(--bg3); color: var(--muted); border: 1px solid var(--border); }
+
+  .prob-bar-wrap { margin: .75rem 0 .4rem; }
+  .prob-label { font-size: .65rem; color: var(--muted); display: flex; justify-content: space-between; margin-bottom: .25rem; }
+  .prob-bar { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+  .prob-fill { height: 100%; border-radius: 3px; transition: width .4s ease; }
+  .prob-fill.ictal    { background: var(--ictal); }
+  .prob-fill.inter    { background: var(--inter); }
+
+  .metric-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: .7rem;
+    padding: .25rem 0;
+    border-bottom: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .metric-row span:last-child { color: var(--text); font-weight: 500; }
+  .metric-row.highlight span:last-child { color: var(--accent); }
+
+  /* Attention heatmap */
+  #heatmap-canvas {
+    width: 100%;
+    border-radius: 4px;
+    image-rendering: pixelated;
+  }
+  .heatmap-legend {
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+    font-size: .6rem;
+    color: var(--muted);
+    margin-top: .4rem;
+  }
+  .legend-grad {
+    flex: 1;
+    height: 6px;
+    border-radius: 3px;
+    background: linear-gradient(to right, var(--bg3), var(--ictal));
+  }
+
+  /* Signal log */
+  .log-box {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: .6rem;
+    font-size: .65rem;
+    height: 140px;
+    overflow-y: auto;
+    line-height: 1.6;
+  }
+  .log-box::-webkit-scrollbar { width: 4px; }
+  .log-box::-webkit-scrollbar-track { background: var(--bg3); }
+  .log-box::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+  .log-entry { padding: 1px 0; border-bottom: 1px solid rgba(255,255,255,.03); }
+  .log-entry .ts { color: var(--muted); margin-right: .5rem; }
+  .log-entry.ok   .msg { color: var(--inter); }
+  .log-entry.warn .msg { color: var(--warn); }
+  .log-entry.err  .msg { color: var(--ictal); }
+  .log-entry.info .msg { color: var(--text); }
+
+  /* Alert flash */
+  .alert-banner {
+    display: none;
+    background: rgba(255,77,109,.15);
+    border: 1px solid var(--ictal);
+    border-radius: 6px;
+    padding: .6rem 1rem;
+    font-size: .8rem;
+    color: var(--ictal);
+    font-weight: 700;
+    letter-spacing: .05em;
+    text-align: center;
+    animation: flashborder 1s infinite;
+    margin-bottom: .75rem;
+  }
+  @keyframes flashborder {
+    0%,100% { border-color: var(--ictal); }
+    50%      { border-color: transparent; }
+  }
+
+  /* Stats row */
+  .stats-row {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    background: var(--border);
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+  }
+  .stat-cell {
+    background: var(--bg2);
+    padding: .6rem 1rem;
+    text-align: center;
+  }
+  .stat-val { font-size: 1.1rem; font-weight: 700; color: #fff; font-family: var(--font-display); }
+  .stat-label { font-size: .6rem; color: var(--muted); margin-top: 1px; }
+
+  /* ── External Data Import ── */
+  .import-zone {
+    border: 1.5px dashed var(--border2);
+    border-radius: 6px;
+    padding: .9rem .75rem;
+    text-align: center;
+    cursor: pointer;
+    transition: all .2s;
+    background: var(--bg3);
+    position: relative;
+  }
+  .import-zone:hover, .import-zone.drag-over {
+    border-color: var(--accent);
+    background: rgba(0,212,255,.05);
+  }
+  .import-zone input[type=file] {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    cursor: pointer;
+    width: 100%;
+    height: 100%;
+  }
+  .import-icon { font-size: 1.4rem; margin-bottom: .3rem; }
+  .import-label { font-size: .65rem; color: var(--muted); line-height: 1.5; }
+  .import-label strong { color: var(--accent); }
+  .import-status {
+    font-size: .65rem;
+    padding: .35rem .6rem;
+    border-radius: 4px;
+    margin-top: .5rem;
+    display: none;
+  }
+  .import-status.ok   { background: rgba(0,229,160,.1); color: var(--inter); border: 1px solid rgba(0,229,160,.25); display: block; }
+  .import-status.err  { background: rgba(255,77,109,.1); color: var(--ictal); border: 1px solid rgba(255,77,109,.25); display: block; }
+  .import-status.info { background: rgba(0,212,255,.07); color: var(--accent); border: 1px solid rgba(0,212,255,.2); display: block; }
+
+  .data-preview-modal {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,.75);
+    z-index: 500;
+    align-items: center;
+    justify-content: center;
+  }
+  .data-preview-modal.open { display: flex; }
+  .data-preview-box {
+    background: var(--bg2);
+    border: 1px solid var(--border2);
+    border-radius: 8px;
+    width: min(95vw, 900px);
+    max-height: 85vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 20px 60px rgba(0,0,0,.6);
+  }
+  .modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: .9rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .modal-title { font-family: var(--font-display); font-size: .9rem; font-weight: 700; color: #fff; }
+  .modal-close {
+    background: none; border: none;
+    color: var(--muted); font-size: 1.3rem;
+    cursor: pointer; padding: 0 .25rem;
+    transition: color .15s;
+  }
+  .modal-close:hover { color: var(--ictal); }
+  .modal-body { flex: 1; overflow: auto; padding: 1rem 1.25rem; }
+  .modal-footer {
+    padding: .75rem 1.25rem;
+    border-top: 1px solid var(--border);
+    display: flex;
+    gap: .6rem;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .modal-btn {
+    padding: .4rem .9rem;
+    border-radius: 4px;
+    border: 1px solid var(--border2);
+    background: var(--bg3);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: .72rem;
+    cursor: pointer;
+    transition: all .15s;
+  }
+  .modal-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .modal-btn.primary-btn {
+    background: rgba(0,212,255,.1);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .modal-btn.primary-btn:hover { background: rgba(0,212,255,.22); }
+  .modal-btn.danger-btn {
+    background: rgba(255,77,109,.08);
+    border-color: var(--ictal);
+    color: var(--ictal);
+  }
+
+  /* Data table */
+  .data-table-wrap { overflow: auto; }
+  .data-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: .68rem;
+  }
+  .data-table th {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    padding: .35rem .6rem;
+    color: var(--accent);
+    font-weight: 600;
+    text-align: left;
+    position: sticky;
+    top: 0;
+    white-space: nowrap;
+  }
+  .data-table td {
+    border: 1px solid var(--border);
+    padding: .3rem .6rem;
+    color: var(--text);
+    white-space: nowrap;
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .data-table tr:nth-child(even) td { background: rgba(255,255,255,.02); }
+  .data-table tr:hover td { background: rgba(0,212,255,.05); }
+
+  .col-map-grid {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    gap: .5rem;
+    align-items: center;
+    margin-bottom: .5rem;
+    font-size: .68rem;
+  }
+  .col-map-grid select {
+    width: 100%;
+    font-size: .68rem;
+  }
+  .col-arrow { color: var(--muted); text-align: center; }
+
+  .import-summary {
+    display: flex;
+    gap: .5rem;
+    flex-wrap: wrap;
+    margin-bottom: .75rem;
+  }
+  .summary-chip {
+    font-size: .62rem;
+    padding: 2px 8px;
+    border-radius: 3px;
+    background: rgba(0,212,255,.08);
+    border: 1px solid rgba(0,212,255,.2);
+    color: var(--accent);
+  }
+  .summary-chip.green {
+    background: rgba(0,229,160,.08);
+    border-color: rgba(0,229,160,.25);
+    color: var(--inter);
+  }
+  .summary-chip.warn {
+    background: rgba(255,183,0,.08);
+    border-color: rgba(255,183,0,.25);
+    color: var(--warn);
+  }
+
+  .tab-row {
+    display: flex;
+    gap: 2px;
+    margin-bottom: 1rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .tab-btn {
+    font-size: .68rem;
+    padding: .35rem .75rem;
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    font-family: var(--font-mono);
+    transition: all .15s;
+  }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-btn:hover:not(.active) { color: var(--text); }
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+
+  /* Case Summary */
+  .cs-metric-cell {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 5px 7px;
+    text-align: center;
+  }
+  .cs-val {
+    font-size: .82rem;
+    font-weight: 700;
+    color: var(--accent);
+    font-family: var(--font-display);
+    line-height: 1.2;
+  }
+  .cs-lbl {
+    font-size: .52rem;
+    color: var(--muted);
+    margin-top: 1px;
+  }
+  #cs-event-log::-webkit-scrollbar { width: 3px; }
+  #cs-event-log::-webkit-scrollbar-track { background: var(--bg3); }
+  #cs-event-log::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+  /* Responsive */
+  @media (max-width: 1024px) {
+    .main { grid-template-columns: 1fr; }
+    .bottom { grid-template-columns: 1fr; }
+    aside { border-right: none; border-bottom: 1px solid var(--border); }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-pulse"></div>
+    NeuroTransformer
+    <span style="font-size:.65rem;font-weight:400;color:var(--muted);margin-left:.25rem">EEG Testing Dashboard</span>
+  </div>
+  <div class="header-meta">
+    <span><div class="status-dot"></div> CHB-MIT · 256 Hz · 22ch</span>
+    <span id="hdr-time">--:--:--</span>
+    <span style="color:var(--accent)">v1.0.0</span>
+  </div>
+</header>
+
+<div class="main">
+
+  <!-- Sidebar -->
+  <aside>
+    <div>
+      <div class="section-title">Signal Generator</div>
+      <div class="control-group">
+        <div class="control-label">Signal type</div>
+        <select id="sig-type" onchange="onSigChange()">
+          <option value="noise">Interictal — broadband noise</option>
+          <option value="ictal3">Ictal — 3 Hz SWD (absence)</option>
+          <option value="ictal6">Ictal — 6 Hz focal onset</option>
+          <option value="ictal12">Ictal — 12 Hz fast activity</option>
+          <option value="mixed">Mixed — onset simulation</option>
+          <option value="custom">Custom frequency</option>
+        </select>
+      </div>
+      <div class="control-group" id="freq-ctrl" style="display:none">
+        <div class="control-label">Frequency (Hz) <span id="freq-val">5</span></div>
+        <input type="range" id="freq-slider" min="1" max="40" value="5" oninput="document.getElementById('freq-val').textContent=this.value"/>
+      </div>
+      <div class="control-group">
+        <div class="control-label">Signal amplitude <span id="amp-val">2.0</span>×</div>
+        <input type="range" id="amp-slider" min="0.5" max="5" step="0.1" value="2.0" oninput="document.getElementById('amp-val').textContent=parseFloat(this.value).toFixed(1)"/>
+      </div>
+      <div class="control-group">
+        <div class="control-label">Noise level <span id="noise-val">0.30</span></div>
+        <input type="range" id="noise-slider" min="0" max="2" step="0.05" value="0.3" oninput="document.getElementById('noise-val').textContent=parseFloat(this.value).toFixed(2)"/>
+      </div>
+      <div class="control-group">
+        <div class="control-label">Affected channels <span id="ch-val">22</span>/22</div>
+        <input type="range" id="ch-slider" min="1" max="22" value="22" oninput="document.getElementById('ch-val').textContent=this.value;updateChannelBadges()"/>
+      </div>
+    </div>
+
+    <div>
+      <div class="section-title">Run Inference</div>
+      <button class="btn primary" onclick="runInference()">▶  Run inference (1 window)</button>
+      <button class="btn" onclick="runStream()">⟳  Auto-stream (500ms)</button>
+      <button class="btn danger" onclick="stopStream()">■  Stop stream</button>
+      <div id="alert-banner" class="alert-banner">⚠ SEIZURE DETECTED</div>
+    </div>
+
+    <div>
+      <div class="section-title">EEG Channels</div>
+      <div class="channel-grid" id="ch-grid"></div>
+    </div>
+
+    <div style="margin-top:auto">
+      <div class="section-title">Backend</div>
+      <div class="control-group">
+        <div class="control-label">API endpoint</div>
+        <select id="backend-mode">
+          <option value="mock">Mock (no backend needed)</option>
+          <option value="api">Live — localhost:3000</option>
+        </select>
+      </div>
+      <div class="metric-row">
+        <span>Status</span>
+        <span id="api-status" style="color:var(--inter)">mock mode</span>
+      </div>
+    </div>
+
+    <!-- External Data Import -->
+    <div>
+      <div class="section-title">External Data Import</div>
+      <div class="import-zone" id="import-zone">
+        <input type="file" id="file-input" accept=".csv,.xlsx,.xls,.pdf,.txt" onchange="handleFileSelect(event)"/>
+        <div class="import-icon">📂</div>
+        <div class="import-label">
+          Drop or click to load<br>
+          <strong>CSV · XLSX · PDF · TXT</strong>
+        </div>
+      </div>
+      <div class="import-status" id="import-status"></div>
+      <button class="btn" style="margin-top:.5rem" onclick="openPreviewModal()" id="preview-btn" disabled>⊞ Preview &amp; Map Columns</button>
+      <button class="btn primary" onclick="injectImportedData()" id="inject-btn" disabled>▶ Use as EEG Input</button>
+    </div>
+  </aside>
+
+  <!-- Main content -->
+  <div class="content">
+
+    <!-- Stats bar -->
+    <div class="stats-row">
+      <div class="stat-cell">
+        <div class="stat-val" id="stat-windows">0</div>
+        <div class="stat-label">Windows processed</div>
+      </div>
+      <div class="stat-cell">
+        <div class="stat-val" id="stat-alerts" style="color:var(--ictal)">0</div>
+        <div class="stat-label">Seizure alerts</div>
+      </div>
+      <div class="stat-cell">
+        <div class="stat-val" id="stat-latency">—</div>
+        <div class="stat-label">Inference (ms)</div>
+      </div>
+      <div class="stat-cell">
+        <div class="stat-val" id="stat-auroc" style="color:var(--accent)">—</div>
+        <div class="stat-label">Session AUROC</div>
+      </div>
+    </div>
+
+    <!-- EEG waveform -->
+    <div class="eeg-panel">
+      <div class="panel-header">
+        <div class="panel-title">EEG Waveform — 22-channel · 1 second window</div>
+        <div style="display:flex;gap:.5rem;align-items:center">
+          <span id="sig-label" class="panel-tag">INTERICTAL</span>
+          <span class="panel-tag" style="background:rgba(0,229,160,.08);border-color:rgba(0,229,160,.3);color:var(--inter)">256 Hz</span>
+        </div>
+      </div>
+      <canvas id="eeg-canvas" height="260"></canvas>
+    </div>
+
+    <!-- Bottom panels -->
+    <div class="bottom">
+
+      <!-- Prediction -->
+      <div class="sub-panel">
+        <div class="section-title">Prediction</div>
+        <div id="pred-badge" class="pred-badge idle">— IDLE</div>
+        <div class="prob-bar-wrap">
+          <div class="prob-label"><span>P(interictal)</span><span id="p-inter-val">—</span></div>
+          <div class="prob-bar"><div class="prob-fill inter" id="p-inter-bar" style="width:0%"></div></div>
+        </div>
+        <div class="prob-bar-wrap">
+          <div class="prob-label"><span>P(ictal)</span><span id="p-ictal-val">—</span></div>
+          <div class="prob-bar"><div class="prob-fill ictal" id="p-ictal-bar" style="width:0%"></div></div>
+        </div>
+        <div style="margin-top:.75rem">
+          <div class="metric-row highlight"><span>Confidence</span><span id="m-conf">—</span></div>
+          <div class="metric-row"><span>Inference time</span><span id="m-inf">—</span></div>
+          <div class="metric-row"><span>Windows run</span><span id="m-wins">0</span></div>
+          <div class="metric-row"><span>Alert threshold</span><span>P(ictal) ≥ 0.85</span></div>
+        </div>
+      </div>
+
+      <!-- Seizure Probability Timeline -->
+      <div class="sub-panel" style="position:relative">
+        <div class="panel-header" style="margin-bottom:.5rem">
+          <div class="section-title" style="margin:0;border:none;padding:0">Seizure Probability — Subject 01 · Pre-ictal → Ictal</div>
+          <div style="display:flex;gap:.4rem;align-items:center">
+            <span id="timeline-badge" class="panel-tag" style="font-size:.58rem">● BASELINE</span>
+            <button id="timeline-play-btn" onclick="toggleTimeline()" style="font-size:.6rem;padding:2px 7px;background:rgba(0,212,255,.1);border:1px solid var(--accent);color:var(--accent);border-radius:3px;cursor:pointer;font-family:var(--font-mono)">▶ PLAY</button>
+          </div>
+        </div>
+        <!-- Phase label strip -->
+        <div style="display:flex;gap:2px;margin-bottom:4px;font-size:.52rem;color:var(--muted)">
+          <div style="flex:3;padding:2px 4px;background:rgba(0,229,160,.08);border:1px solid rgba(0,229,160,.15);border-radius:2px;color:var(--inter);text-align:center">BASELINE (0–3 min)</div>
+          <div style="flex:3;padding:2px 4px;background:rgba(255,183,0,.07);border:1px solid rgba(255,183,0,.15);border-radius:2px;color:var(--warn);text-align:center">PRE-ICTAL (3–7 min)</div>
+          <div style="flex:2;padding:2px 4px;background:rgba(255,77,109,.1);border:1px solid rgba(255,77,109,.2);border-radius:2px;color:var(--ictal);text-align:center">ICTAL (7–10 min)</div>
+        </div>
+        <canvas id="prob-timeline-canvas" height="130" style="width:100%;display:block;border-radius:4px;background:var(--bg3)"></canvas>
+        <!-- EEG rhythm strip -->
+        <div style="font-size:.55rem;color:var(--muted);margin-top:5px;margin-bottom:2px">Live EEG rhythm (current window)</div>
+        <canvas id="rhythm-strip-canvas" height="44" style="width:100%;display:block;border-radius:3px;background:var(--bg3)"></canvas>
+        <!-- Stats row below -->
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;margin-top:6px">
+          <div style="background:var(--bg3);border:1px solid var(--border);border-radius:3px;padding:4px 6px;text-align:center">
+            <div id="tl-elapsed" style="font-size:.78rem;font-weight:700;color:#fff;font-family:var(--font-display)">0:00</div>
+            <div style="font-size:.52rem;color:var(--muted)">Elapsed</div>
+          </div>
+          <div style="background:var(--bg3);border:1px solid var(--border);border-radius:3px;padding:4px 6px;text-align:center">
+            <div id="tl-phase" style="font-size:.78rem;font-weight:700;color:var(--inter);font-family:var(--font-display)">—</div>
+            <div style="font-size:.52rem;color:var(--muted)">Phase</div>
+          </div>
+          <div style="background:var(--bg3);border:1px solid var(--border);border-radius:3px;padding:4px 6px;text-align:center">
+            <div id="tl-pictal-now" style="font-size:.78rem;font-weight:700;color:var(--accent);font-family:var(--font-display)">—</div>
+            <div style="font-size:.52rem;color:var(--muted)">P(ictal) now</div>
+          </div>
+        </div>
+        <!-- hidden canvas for heatmap compatibility -->
+        <canvas id="heatmap-canvas" width="1" height="1" style="display:none"></canvas>
+      </div>
+
+      <!-- Case Summary -->
+      <div class="sub-panel" id="case-summary-panel">
+        <div class="section-title">Case Summary — Subject 01 · CHB-MIT</div>
+
+        <!-- Patient card -->
+        <div style="background:var(--bg3);border:1px solid var(--border);border-radius:5px;padding:.6rem .75rem;margin-bottom:.6rem">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.4rem">
+            <span style="font-size:.7rem;font-weight:700;color:#fff;font-family:var(--font-display)">SUBJ-01 · Female · 11 yr</span>
+            <span id="cs-status-badge" style="font-size:.58rem;padding:2px 7px;border-radius:3px;background:rgba(0,229,160,.1);border:1px solid rgba(0,229,160,.25);color:var(--inter)">MONITORING</span>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:3px 10px;font-size:.62rem;color:var(--muted)">
+            <span>Dataset: <b style="color:var(--text)">CHB-MIT Scalp EEG</b></span>
+            <span>File: <b style="color:var(--text)">chb01_03.edf</b></span>
+            <span>Fs: <b style="color:var(--accent)">256 Hz</b></span>
+            <span>Channels: <b style="color:var(--accent)">22 bipolar</b></span>
+            <span>Diagnosis: <b style="color:var(--text)">Focal epilepsy</b></span>
+            <span>Onset zone: <b style="color:var(--ictal)">F7-T7 (L-temp)</b></span>
+          </div>
+        </div>
+
+        <!-- Live event log — compact -->
+        <div style="font-size:.6rem;color:var(--muted);margin-bottom:3px;display:flex;justify-content:space-between">
+          <span>EVENT LOG</span>
+          <span id="cs-event-count" style="color:var(--accent)">0 events</span>
+        </div>
+        <div id="cs-event-log" style="background:var(--bg3);border:1px solid var(--border);border-radius:4px;padding:.45rem .5rem;height:88px;overflow-y:auto;font-size:.6rem;line-height:1.7">
+          <span style="color:var(--muted)">Awaiting replay…</span>
+        </div>
+
+        <!-- Live metrics grid -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-top:.5rem">
+          <div class="cs-metric-cell">
+            <div class="cs-val" id="cs-peak-pictal">—</div>
+            <div class="cs-lbl">Peak P(ictal)</div>
+          </div>
+          <div class="cs-metric-cell">
+            <div class="cs-val" id="cs-onset-time" style="color:var(--ictal)">—</div>
+            <div class="cs-lbl">Onset detected</div>
+          </div>
+          <div class="cs-metric-cell">
+            <div class="cs-val" id="cs-preictal-dur" style="color:var(--warn)">—</div>
+            <div class="cs-lbl">Pre-ictal duration</div>
+          </div>
+          <div class="cs-metric-cell">
+            <div class="cs-val" id="cs-ictal-dur" style="color:var(--ictal)">—</div>
+            <div class="cs-lbl">Ictal duration</div>
+          </div>
+          <div class="cs-metric-cell">
+            <div class="cs-val" id="cs-dom-freq">—</div>
+            <div class="cs-lbl">Dominant freq</div>
+          </div>
+          <div class="cs-metric-cell">
+            <div class="cs-val" id="cs-spread">—</div>
+            <div class="cs-lbl">Channel spread</div>
+          </div>
+        </div>
+
+        <!-- Freq band power mini-bars -->
+        <div style="margin-top:.55rem">
+          <div style="font-size:.58rem;color:var(--muted);margin-bottom:4px">BAND POWER (relative)</div>
+          <div id="band-bars" style="display:flex;flex-direction:column;gap:3px"></div>
+        </div>
+
+        <!-- Transformer model info -->
+        <div style="margin-top:.55rem;background:rgba(0,212,255,.04);border:1px solid rgba(0,212,255,.15);border-radius:4px;padding:.45rem .6rem">
+          <div style="font-size:.58rem;color:var(--muted);margin-bottom:3px">MODEL · NeuroTransformer v1.0</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:2px 8px;font-size:.6rem">
+            <span style="color:var(--muted)">Trained on: <b style="color:var(--text)">Subj-01 baseline</b></span>
+            <span style="color:var(--muted)">Arch: <b style="color:var(--text)">22-head Attn</b></span>
+            <span style="color:var(--muted)">Window: <b style="color:var(--accent)">1s / 256pt</b></span>
+            <span style="color:var(--muted)">Threshold: <b style="color:var(--ictal)">P≥0.85</b></span>
+          </div>
+          <div style="margin-top:4px;display:flex;align-items:center;gap:5px">
+            <span style="font-size:.58rem;color:var(--muted)">Session AUROC</span>
+            <div style="flex:1;height:5px;background:var(--border);border-radius:3px;overflow:hidden">
+              <div id="cs-auroc-bar" style="height:100%;width:0%;background:var(--accent);border-radius:3px;transition:width .5s"></div>
+            </div>
+            <span id="cs-auroc-val" style="font-size:.6rem;color:var(--accent);min-width:30px">—</span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ── Data Preview / Column-Map Modal ─────────────────────────────────── -->
+<div class="data-preview-modal" id="preview-modal">
+  <div class="data-preview-box">
+    <div class="modal-header">
+      <div class="modal-title">📊 External Data — Preview &amp; Column Mapping</div>
+      <button class="modal-close" onclick="closePreviewModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <!-- Summary chips -->
+      <div class="import-summary" id="modal-summary"></div>
+
+      <!-- Tabs -->
+      <div class="tab-row">
+        <button class="tab-btn active" onclick="switchTab('tab-table',this)">Raw Data</button>
+        <button class="tab-btn" onclick="switchTab('tab-map',this)">Channel Mapping</button>
+        <button class="tab-btn" onclick="switchTab('tab-live',this)">Live Preview</button>
+      </div>
+
+      <!-- Tab: Raw table -->
+      <div class="tab-pane active" id="tab-table">
+        <div class="data-table-wrap" id="table-wrap"></div>
+      </div>
+
+      <!-- Tab: Column mapping -->
+      <div class="tab-pane" id="tab-map">
+        <div style="font-size:.7rem;color:var(--muted);margin-bottom:.75rem">
+          Map columns from your file to EEG channels. The dashboard expects 22 channels × 256 samples.<br>
+          Unmapped channels will be filled with synthetic noise.
+        </div>
+        <div id="col-map-container"></div>
+      </div>
+
+      <!-- Tab: Live signal preview -->
+      <div class="tab-pane" id="tab-live">
+        <div style="font-size:.7rem;color:var(--muted);margin-bottom:.6rem">Preview of the first imported window (22-ch × 256 samples).</div>
+        <canvas id="preview-canvas" height="220" style="width:100%;border-radius:4px;background:var(--bg3);display:block"></canvas>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="modal-btn primary-btn" onclick="confirmImport()">✓ Confirm &amp; Inject into Dashboard</button>
+      <button class="modal-btn" onclick="closePreviewModal()">Cancel</button>
+      <span id="modal-row-info" style="font-size:.65rem;color:var(--muted);margin-left:auto"></span>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Constants ──────────────────────────────────────────────────────────────
+const N_CH = 22, N_T = 256, SFREQ = 256;
+const CH_NAMES = [
+  'FP1-F7','F7-T7','T7-P7','P7-O1',
+  'FP1-F3','F3-C3','C3-P3','P3-O1',
+  'FP2-F4','F4-C4','C4-P4','P4-O2',
+  'FP2-F8','F8-T8','T8-P8','P8-O2',
+  'FZ-CZ','CZ-PZ','P7-T7','T7-FT9','FT9-FT10','FT10-T8'
+];
+const t = Array.from({length:N_T},(_,i)=>i/SFREQ);
+
+// ── State ──────────────────────────────────────────────────────────────────
+let windows=0, alerts=0, streamTimer=null;
+let allPictal=[], allLabels=[];
+
+// ── Build channel badges ────────────────────────────────────────────────────
+const grid = document.getElementById('ch-grid');
+CH_NAMES.forEach((n,i)=>{
+  const d = document.createElement('div');
+  d.className='ch-badge active';
+  d.id=`ch-${i}`;
+  d.textContent=n;
+  d.title=`Channel ${i+1}: ${n}`;
+  grid.appendChild(d);
+});
+
+function updateChannelBadges(){
+  const active = parseInt(document.getElementById('ch-slider').value);
+  CH_NAMES.forEach((_,i)=>{
+    document.getElementById(`ch-${i}`).className='ch-badge'+(i<active?' active':'');
+  });
+}
+
+// ── Signal generation ───────────────────────────────────────────────────────
+function makeSignal(){
+  const type  = document.getElementById('sig-type').value;
+  const amp   = parseFloat(document.getElementById('amp-slider').value);
+  const noise = parseFloat(document.getElementById('noise-slider').value);
+  const nCh   = parseInt(document.getElementById('ch-slider').value);
+  const customFreq = parseFloat(document.getElementById('freq-slider').value);
+
+  const freqMap={ictal3:3,ictal6:6,ictal12:12,custom:customFreq};
+  const data = [];
+
+  for(let c=0;c<N_CH;c++){
+    const row=[];
+    const phase=Math.random()*Math.PI*2;
+    for(let i=0;i<N_T;i++){
+      let v = noise*(Math.random()-.5)*2;
+      if(c<nCh){
+        if(type==='noise'){
+          v += (Math.random()-.5)*1.2;
+        } else if(type==='mixed'){
+          const prog=i/N_T;
+          const f = 3+prog*9;
+          v += amp*prog*Math.sin(2*Math.PI*f*t[i]+phase);
+        } else if(freqMap[type]){
+          v += amp*Math.sin(2*Math.PI*freqMap[type]*t[i]+phase);
+        }
+      }
+      row.push(v);
+    }
+    data.push(row);
+  }
+  return data;
+}
+
+// ── EEG Canvas ──────────────────────────────────────────────────────────────
+const eegCanvas = document.getElementById('eeg-canvas');
+const eegCtx    = eegCanvas.getContext('2d');
+
+function drawEEG(data, isIctal){
+  const W=eegCanvas.offsetWidth||800, H=260;
+  eegCanvas.width=W; eegCanvas.height=H;
+  eegCtx.fillStyle='#111820';
+  eegCtx.fillRect(0,0,W,H);
+
+  const trackH = H/N_CH;
+  data.forEach((ch,ci)=>{
+    const y0 = ci*trackH + trackH/2;
+    const scale = trackH*0.38;
+    const active = ci < parseInt(document.getElementById('ch-slider').value);
+    eegCtx.beginPath();
+    const color = !active ? '#1e2d3d' : isIctal ? `rgba(255,77,109,${0.4+0.6*(ci/N_CH)})` : `rgba(0,212,255,${0.3+0.5*(ci/N_CH)})`;
+    eegCtx.strokeStyle=color;
+    eegCtx.lineWidth=0.8;
+    ch.forEach((v,i)=>{
+      const x=i/N_T*W, y=y0-v*scale;
+      i===0?eegCtx.moveTo(x,y):eegCtx.lineTo(x,y);
+    });
+    eegCtx.stroke();
+    // channel label
+    eegCtx.fillStyle=active?(isIctal?'rgba(255,77,109,.5)':'rgba(0,212,255,.4)'):'#1e2d3d';
+    eegCtx.font='8px JetBrains Mono';
+    eegCtx.fillText(CH_NAMES[ci],4,y0-trackH*0.3+4);
+  });
+
+  // time axis
+  eegCtx.strokeStyle='rgba(255,255,255,.06)';
+  eegCtx.lineWidth=0.5;
+  for(let s=0;s<=4;s++){
+    const x=s/4*W;
+    eegCtx.beginPath(); eegCtx.moveTo(x,0); eegCtx.lineTo(x,H); eegCtx.stroke();
+    eegCtx.fillStyle='rgba(255,255,255,.25)';
+    eegCtx.font='8px JetBrains Mono';
+    eegCtx.fillText(`${s*0.25}s`,x+3,H-4);
+  }
+}
+
+// ── Heatmap ─────────────────────────────────────────────────────────────────
+const hmCanvas = document.getElementById('heatmap-canvas');
+const hmCtx    = hmCanvas.getContext('2d');
+
+function drawHeatmap(attn22){
+  const S=10;
+  hmCanvas.width=N_CH*S; hmCanvas.height=N_CH*S;
+  let mx=0;
+  attn22.forEach(r=>r.forEach(v=>{if(v>mx)mx=v;}));
+  attn22.forEach((row,i)=>row.forEach((val,j)=>{
+    const norm=mx>0?val/mx:0;
+    const r=Math.round(255*norm);
+    const b=Math.round(60*(1-norm));
+    hmCtx.fillStyle=`rgb(${r},${Math.round(30+40*norm)},${b+20})`;
+    hmCtx.fillRect(j*S,i*S,S,S);
+  }));
+  // channel tick labels — top
+  hmCtx.fillStyle='rgba(255,255,255,.3)';
+  hmCtx.font='5px JetBrains Mono';
+  for(let i=0;i<N_CH;i+=4){
+    hmCtx.fillText(i,i*S+1,8);
+    hmCtx.fillText(i,1,i*S+8);
+  }
+}
+
+// ── Mock inference ──────────────────────────────────────────────────────────
+function mockInference(data){
+  const t0=performance.now();
+  const type=document.getElementById('sig-type').value;
+  const isIctal=type!=='noise';
+
+  // Simulate model: compute RMS per channel, detect oscillatory power
+  let power=0;
+  data.forEach(ch=>{
+    const rms=Math.sqrt(ch.reduce((s,v)=>s+v*v,0)/N_T);
+    power+=rms;
+  });
+  power/=N_CH;
+
+  // Add noise to simulate model uncertainty
+  const noise=0.08*(Math.random()-.5);
+  let pIctal = isIctal
+    ? Math.min(.98,0.55+power*0.12+noise)
+    : Math.max(.02,0.08-power*0.02+Math.abs(noise));
+
+  // Mixed type has gradual onset
+  if(type==='mixed') pIctal=Math.min(.92,0.35+power*0.18+noise);
+
+  const pInter=1-pIctal;
+
+  // Generate plausible 22x22 attention map
+  const attn=Array.from({length:N_CH},(_,i)=>
+    Array.from({length:N_CH},(_,j)=>{
+      if(i===j) return 0;
+      const dist=Math.abs(i-j);
+      let base=isIctal?(0.08-dist*0.003):(0.04-dist*0.001);
+      base=Math.max(0,base)+(Math.random()*0.02);
+      // Hot zones for seizure: temporal-frontal connections (ch 1-3, 13-15)
+      if(isIctal&&((i<4&&j>12&&j<16)||(j<4&&i>12&&i<16))) base+=0.06+Math.random()*0.04;
+      return Math.max(0,base);
+    })
+  );
+  // Normalise rows
+  attn.forEach(row=>{
+    const s=row.reduce((a,b)=>a+b,0)||1;
+    row.forEach((_,j)=>row[j]/=s);
+  });
+
+  const ms=Math.round(performance.now()-t0+6+Math.random()*8);
+  return {pIctal,pInter,attn,ms,isIctal};
+}
+
+async function liveInference(data){
+  const url='http://localhost:3000/predict';
+  const t0=performance.now();
+  const res=await fetch(url,{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({eeg:data})
+  });
+  const j=await res.json();
+  const ms=Math.round(performance.now()-t0);
+  // fetch attention
+  let attn=Array.from({length:22},()=>Array(22).fill(0));
+  if(j.requestId){
+    try{
+      const ar=await fetch(`http://localhost:3000/attention/${j.requestId}`);
+      const aj=await ar.json();
+      if(aj.attentionLayer1) attn=aj.attentionLayer1;
+    }catch(e){}
+  }
+  return{pIctal:j.probabilities.ictal,pInter:j.probabilities.interictal,attn,ms,isIctal:j.prediction==='ictal'};
+}
+
+// ── Update UI ───────────────────────────────────────────────────────────────
+function updatePredUI(result,data){
+  const {pIctal,pInter,attn,ms,isIctal}=result;
+
+  // Badge
+  const badge=document.getElementById('pred-badge');
+  badge.className='pred-badge '+(isIctal?'ictal':'interictal');
+  badge.textContent=isIctal?'⚡ ICTAL':'✓ INTERICTAL';
+
+  // Bars
+  document.getElementById('p-inter-val').textContent=(pInter*100).toFixed(1)+'%';
+  document.getElementById('p-ictal-val').textContent=(pIctal*100).toFixed(1)+'%';
+  document.getElementById('p-inter-bar').style.width=(pInter*100)+'%';
+  document.getElementById('p-ictal-bar').style.width=(pIctal*100)+'%';
+
+  // Metrics
+  document.getElementById('m-conf').textContent=(Math.max(pIctal,pInter)*100).toFixed(1)+'%';
+  document.getElementById('m-inf').textContent=ms+'ms';
+  document.getElementById('m-wins').textContent=windows;
+
+  // Stats bar
+  document.getElementById('stat-windows').textContent=windows;
+  document.getElementById('stat-alerts').textContent=alerts;
+  document.getElementById('stat-latency').textContent=ms+'ms';
+
+  // AUROC estimate
+  if(allPictal.length>5){
+    const auroc=estimateAUROC();
+    document.getElementById('stat-auroc').textContent=auroc.toFixed(3);
+    const csAuroc=document.getElementById('cs-auroc-val');
+    const csBar=document.getElementById('cs-auroc-bar');
+    if(csAuroc){ csAuroc.textContent=auroc.toFixed(3); }
+    if(csBar){ csBar.style.width=(auroc*100)+'%'; csBar.style.background=auroc>0.85?'var(--inter)':auroc>0.65?'var(--warn)':'var(--ictal)'; }
+  }
+
+  // Alert banner
+  const banner=document.getElementById('alert-banner');
+  if(pIctal>=0.85){ banner.style.display='block'; alerts++; document.getElementById('stat-alerts').textContent=alerts; }
+  else banner.style.display='none';
+
+  // Heatmap (silently skip if canvas not visible)
+  if(attn) drawHeatmap(attn);
+
+  // Hot channels
+  const nActive=parseInt(document.getElementById('ch-slider').value);
+  CH_NAMES.forEach((_,i)=>{
+    const el=document.getElementById(`ch-${i}`);
+    if(!el) return;
+    if(i>=nActive){ el.className='ch-badge'; return; }
+    el.className='ch-badge '+(isIctal&&i<nActive&&Math.random()>.5?'hot':'active');
+  });
+
+  // Log metrics (only if elements exist)
+  const logSigtype=document.getElementById('log-sigtype');
+  const logIctalrate=document.getElementById('log-ictalrate');
+  const logAvgpictal=document.getElementById('log-avgpictal');
+  if(logSigtype) logSigtype.textContent=document.getElementById('sig-type').options[document.getElementById('sig-type').selectedIndex].text.split('—')[0].trim();
+  if(logIctalrate) logIctalrate.textContent=allLabels.length?((allLabels.filter(v=>v).length/allLabels.length*100).toFixed(0)+'%'):'—';
+  if(logAvgpictal) logAvgpictal.textContent=allPictal.length?(allPictal.reduce((a,b)=>a+b,0)/allPictal.length*100).toFixed(1)+'%':'—';
+
+  // Update case summary
+  updateCaseSummary(pIctal, isIctal, data);
+}
+
+function addLog(msg,type='info'){
+  // Primary: sidebar event log in case summary
+  const box=document.getElementById('cs-event-log');
+  if(!box) return;
+  // Clear placeholder on first entry
+  if(box.querySelector('span[style*="muted"]')) box.innerHTML='';
+  const ts=new Date().toTimeString().slice(0,8);
+  const colors={ok:'var(--inter)',warn:'var(--warn)',err:'var(--ictal)',info:'var(--text)'};
+  const d=document.createElement('div');
+  d.style.cssText='padding:1px 0;border-bottom:1px solid rgba(255,255,255,.03)';
+  d.innerHTML=`<span style="color:var(--muted);margin-right:.4rem">${ts}</span><span style="color:${colors[type]||colors.info}">${msg}</span>`;
+  box.appendChild(d);
+  box.scrollTop=box.scrollHeight;
+  // Trim to 120 entries
+  while(box.children.length>120) box.removeChild(box.firstChild);
+  // Update event count
+  const countEl=document.getElementById('cs-event-count');
+  if(countEl) countEl.textContent=box.children.length+' events';
+}
+
+// ── Case Summary live updater ────────────────────────────────────────────────
+let csPeakPictal = 0;
+let csOnsetTime  = null;
+let csPreIctalStart = null;
+let csIctalStart = null;
+
+function updateCaseSummary(pIctal, isIctal, data) {
+  // Peak
+  if (pIctal > csPeakPictal) {
+    csPeakPictal = pIctal;
+    const el = document.getElementById('cs-peak-pictal');
+    if(el){ el.textContent = (pIctal*100).toFixed(1)+'%'; el.style.color = pIctal>0.85?'var(--ictal)':pIctal>0.5?'var(--warn)':'var(--accent)'; }
+  }
+
+  // Pre-ictal tracking
+  if (pIctal > 0.3 && !csPreIctalStart) {
+    csPreIctalStart = new Date();
+    const el = document.getElementById('cs-preictal-dur');
+    if(el){ el.textContent = 'started'; el.style.color='var(--warn)'; }
+  }
+  if (csPreIctalStart && !csIctalStart) {
+    const dur = Math.round((new Date() - csPreIctalStart)/1000);
+    const el = document.getElementById('cs-preictal-dur');
+    if(el) el.textContent = dur + 's elapsed';
+  }
+
+  // Ictal onset
+  if (pIctal >= 0.85 && !csOnsetTime) {
+    csOnsetTime = new Date();
+    const ts = csOnsetTime.toTimeString().slice(0,8);
+    const el = document.getElementById('cs-onset-time');
+    if(el){ el.textContent = ts; }
+    csIctalStart = csOnsetTime;
+    // Pre-ictal final duration
+    if (csPreIctalStart) {
+      const dur = Math.round((csOnsetTime - csPreIctalStart)/1000);
+      const el2 = document.getElementById('cs-preictal-dur');
+      if(el2){ el2.textContent = dur+'s'; }
+    }
+    // Update status badge
+    const sb = document.getElementById('cs-status-badge');
+    if(sb){ sb.textContent='⚡ SEIZURE'; sb.style.background='rgba(255,77,109,.15)'; sb.style.borderColor='rgba(255,77,109,.4)'; sb.style.color='var(--ictal)'; }
+  }
+
+  // Ictal duration counter
+  if (csIctalStart) {
+    const dur = Math.round((new Date() - csIctalStart)/1000);
+    const el = document.getElementById('cs-ictal-dur');
+    if(el){ el.textContent = dur+'s'; }
+  }
+
+  // Dominant freq & spread estimate from signal
+  if (data && data.length) {
+    const flat = data[0]; // use ch0
+    const mean = flat.reduce((a,b)=>a+b,0)/flat.length;
+    // Zero-crossing rate as crude freq estimator
+    let zc = 0;
+    for(let i=1;i<flat.length;i++) if((flat[i]-mean)*(flat[i-1]-mean)<0) zc++;
+    const domFreq = ((zc/2) / (flat.length/256)).toFixed(1);
+    const elF = document.getElementById('cs-dom-freq');
+    if(elF) elF.textContent = domFreq+' Hz';
+
+    // Spread: channels above noise threshold
+    const spread = data.filter(ch => {
+      const rms = Math.sqrt(ch.reduce((s,v)=>s+v*v,0)/ch.length);
+      return rms > 0.5;
+    }).length;
+    const elS = document.getElementById('cs-spread');
+    if(elS){ elS.textContent = spread+'/'+N_CH; elS.style.color=spread>16?'var(--ictal)':spread>10?'var(--warn)':'var(--accent)'; }
+
+    // Band power bars
+    renderBandBars(flat);
+  }
+}
+
+// ── Band power mini bars ──────────────────────────────────────────────────────
+const BANDS = [
+  { name:'δ (0.5–4Hz)',   color:'#4ecdc4', freqLow:0.5, freqHigh:4  },
+  { name:'θ (4–8Hz)',     color:'#a8dadc', freqLow:4,   freqHigh:8  },
+  { name:'α (8–13Hz)',    color:'#00d4ff', freqLow:8,   freqHigh:13 },
+  { name:'β (13–30Hz)',   color:'#ffb700', freqLow:13,  freqHigh:30 },
+  { name:'γ (30–50Hz)',   color:'#ff4d6d', freqLow:30,  freqHigh:50 },
+];
+
+function renderBandBars(signal) {
+  const container = document.getElementById('band-bars');
+  if(!container) return;
+
+  // Simple DFT band power (subsample for speed)
+  const N = signal.length;
+  const powers = BANDS.map(b => {
+    let p = 0, count = 0;
+    for(let k=1; k<N/2; k++) {
+      const freq = k * 256 / N;
+      if(freq >= b.freqLow && freq < b.freqHigh) {
+        // Compute DFT component magnitude squared
+        let re=0, im=0;
+        const step = Math.max(1, Math.floor(N/64));
+        for(let n=0; n<N; n+=step) {
+          re += signal[n] * Math.cos(2*Math.PI*k*n/N);
+          im -= signal[n] * Math.sin(2*Math.PI*k*n/N);
+        }
+        p += re*re + im*im;
+        count++;
+      }
+    }
+    return count > 0 ? p/count : 0;
+  });
+
+  const maxP = Math.max(...powers, 0.001);
+  container.innerHTML = powers.map((p, i) => {
+    const pct = Math.min(100, (p/maxP)*100);
+    return `<div style="display:flex;align-items:center;gap:5px">
+      <span style="font-size:.55rem;color:var(--muted);width:70px;flex-shrink:0">${BANDS[i].name}</span>
+      <div style="flex:1;height:6px;background:var(--border);border-radius:3px;overflow:hidden">
+        <div style="height:100%;width:${pct.toFixed(1)}%;background:${BANDS[i].color};border-radius:3px;transition:width .4s ease"></div>
+      </div>
+      <span style="font-size:.55rem;color:${BANDS[i].color};width:32px;text-align:right">${pct.toFixed(0)}%</span>
+    </div>`;
+  }).join('');
+}
+
+// ── AUROC estimate ──────────────────────────────────────────────────────────
+function estimateAUROC(){
+  const pos=allPictal.filter((_,i)=>allLabels[i]);
+  const neg=allPictal.filter((_,i)=>!allLabels[i]);
+  if(!pos.length||!neg.length) return 0;
+  let count=0;
+  pos.forEach(p=>neg.forEach(n=>{ if(p>n)count++; else if(p===n)count+=.5; }));
+  return count/(pos.length*neg.length);
+}
+
+// ── Main run ─────────────────────────────────────────────────────────────────
+async function runInference(){
+  const data=makeSignal();
+  const sigType=document.getElementById('sig-type').value;
+  const isIctal=sigType!=='noise';
+
+  // Draw waveform
+  document.getElementById('sig-label').textContent=isIctal?'ICTAL':'INTERICTAL';
+  document.getElementById('sig-label').style.background=isIctal?'rgba(255,77,109,.12)':'rgba(0,212,255,.1)';
+  document.getElementById('sig-label').style.borderColor=isIctal?'rgba(255,77,109,.3)':'rgba(0,212,255,.3)';
+  document.getElementById('sig-label').style.color=isIctal?'var(--ictal)':'var(--accent)';
+  drawEEG(data,isIctal);
+
+  const mode=document.getElementById('backend-mode').value;
+  let result;
+  try{
+    result = mode==='api' ? await liveInference(data) : mockInference(data);
+    document.getElementById('api-status').textContent=mode==='api'?'connected':'mock mode';
+    document.getElementById('api-status').style.color=mode==='api'?'var(--inter)':'var(--warn)';
+  } catch(e){
+    addLog('API unreachable — falling back to mock','warn');
+    result=mockInference(data);
+    document.getElementById('api-status').textContent='fallback mock';
+    document.getElementById('api-status').style.color='var(--warn)';
+  }
+
+  windows++;
+  allPictal.push(result.pIctal);
+  allLabels.push(result.isIctal);
+
+  updatePredUI(result,data);
+  addLog(
+    `[${result.isIctal?'ICTAL':'INTER'}] P(ictal)=${( result.pIctal*100).toFixed(1)}% conf=${(Math.max(result.pIctal,result.pInter)*100).toFixed(1)}% t=${result.ms}ms`,
+    result.isIctal?'err':'ok'
+  );
+}
+
+function runStream(){
+  if(streamTimer) clearInterval(streamTimer);
+  addLog('Auto-stream started (500ms)','info');
+  streamTimer=setInterval(runInference,500);
+}
+function stopStream(){
+  if(streamTimer){ clearInterval(streamTimer); streamTimer=null; addLog('Stream stopped','warn'); }
+}
+
+function onSigChange(){
+  const t=document.getElementById('sig-type').value;
+  document.getElementById('freq-ctrl').style.display=t==='custom'?'block':'none';
+}
+
+// ── Clock ────────────────────────────────────────────────────────────────────
+setInterval(()=>{
+  document.getElementById('hdr-time').textContent=new Date().toTimeString().slice(0,8);
+},1000);
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+(function init(){
+  const data=makeSignal();
+  drawEEG(data,false);
+  drawHeatmap(Array.from({length:N_CH},()=>Array(N_CH).fill(0)));
+  addLog('NeuroTransformer dashboard initialised','ok');
+  addLog('Backend: mock mode (no server required)','info');
+  addLog('Click "Run inference" to test a window','info');
+})();
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ── EXTERNAL DATA IMPORT MODULE ─────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+let importedRaw    = [];   // array of rows (each row = array of values)
+let importedHeaders = [];  // column header names
+let importedFileName = '';
+let importedFileType = '';
+let columnMapping  = {};   // { chIndex: colIndex } — which file col → which EEG channel
+let importedEEGWindows = []; // parsed EEG windows ready for injection
+let currentWindowIdx = 0;  // pointer for streaming injected data
+
+// ── Drag-and-drop ──────────────────────────────────────────────────────────
+const importZone = document.getElementById('import-zone');
+importZone.addEventListener('dragover', e => { e.preventDefault(); importZone.classList.add('drag-over'); });
+importZone.addEventListener('dragleave', () => importZone.classList.remove('drag-over'));
+importZone.addEventListener('drop', e => {
+  e.preventDefault();
+  importZone.classList.remove('drag-over');
+  const file = e.dataTransfer.files[0];
+  if (file) processFile(file);
+});
+
+function handleFileSelect(e) {
+  const file = e.target.files[0];
+  if (file) processFile(file);
+}
+
+// ── File dispatcher ─────────────────────────────────────────────────────────
+function processFile(file) {
+  importedFileName = file.name;
+  const ext = file.name.split('.').pop().toLowerCase();
+  importedFileType = ext;
+  setImportStatus('info', `⏳ Reading ${file.name}…`);
+  const reader = new FileReader();
+
+  if (ext === 'csv' || ext === 'txt') {
+    reader.onload = e => parseCSV(e.target.result);
+    reader.readAsText(file);
+  } else if (ext === 'xlsx' || ext === 'xls') {
+    reader.onload = e => parseXLSX(e.target.result);
+    reader.readAsArrayBuffer(file);
+  } else if (ext === 'pdf') {
+    reader.onload = e => parsePDFText(e.target.result);
+    reader.readAsArrayBuffer(file);
+  } else {
+    setImportStatus('err', '✗ Unsupported format. Use CSV, XLSX, XLS, TXT, or PDF.');
+  }
+}
+
+// ── CSV / TXT parser ─────────────────────────────────────────────────────────
+function parseCSV(text) {
+  const lines = text.trim().split(/\r?\n/).filter(l => l.trim());
+  if (!lines.length) { setImportStatus('err','✗ Empty file.'); return; }
+
+  // Auto-detect delimiter
+  const delimiters = [',', '\t', ';', '|'];
+  let delimiter = ',';
+  let maxCols = 0;
+  delimiters.forEach(d => {
+    const cols = lines[0].split(d).length;
+    if (cols > maxCols) { maxCols = cols; delimiter = d; }
+  });
+
+  const rows = lines.map(l => l.split(delimiter).map(v => v.trim().replace(/^"|"$/g,'')));
+  // First row as header if non-numeric
+  const firstRow = rows[0];
+  const isHeader = firstRow.some(v => isNaN(parseFloat(v)));
+  importedHeaders = isHeader ? firstRow : firstRow.map((_,i) => `Col_${i+1}`);
+  importedRaw = isHeader ? rows.slice(1) : rows;
+
+  finaliseImport(`CSV/TXT — ${delimiter === '\t' ? 'Tab' : delimiter} delimited`);
+}
+
+// ── XLSX parser ───────────────────────────────────────────────────────────────
+function parseXLSX(buffer) {
+  try {
+    const wb = XLSX.read(buffer, { type: 'array' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const data = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+    if (!data.length) { setImportStatus('err','✗ Empty sheet.'); return; }
+    const firstRow = data[0];
+    const isHeader = firstRow.some(v => isNaN(parseFloat(v)));
+    importedHeaders = isHeader ? firstRow.map(String) : firstRow.map((_,i)=>`Col_${i+1}`);
+    importedRaw = (isHeader ? data.slice(1) : data).map(r => r.map(String));
+    finaliseImport(`Excel (.${importedFileType}) — Sheet: "${wb.SheetNames[0]}"`);
+  } catch(e) {
+    setImportStatus('err','✗ Could not parse Excel file: ' + e.message);
+  }
+}
+
+// ── PDF text extractor (via ArrayBuffer → text heuristic) ────────────────────
+// We parse PDF streams for numeric tables without requiring pdf.js
+function parsePDFText(buffer) {
+  try {
+    const bytes = new Uint8Array(buffer);
+    let text = '';
+    for (let i = 0; i < bytes.length; i++) {
+      if (bytes[i] >= 32 && bytes[i] < 127) text += String.fromCharCode(bytes[i]);
+      else if (bytes[i] === 10 || bytes[i] === 13) text += '\n';
+    }
+    // Extract numeric lines (EEG data or tables)
+    const lines = text.split('\n').map(l => l.trim()).filter(l => l);
+    const numericLines = lines.filter(l => {
+      const parts = l.split(/[\s,;\t|]+/);
+      const nums = parts.filter(p => !isNaN(parseFloat(p)) && p.trim() !== '');
+      return nums.length >= 2;
+    });
+
+    if (numericLines.length < 2) {
+      // Fallback: try to show any structured table-like text
+      setImportStatus('warn','⚠ PDF has limited numeric data. Showing extracted text rows.');
+      const textLines = lines.filter(l=>l.length > 3 && l.length < 200).slice(0,200);
+      importedHeaders = ['Extracted Text'];
+      importedRaw = textLines.map(l=>[l]);
+      finaliseImport('PDF — text extraction (limited numeric data)');
+      return;
+    }
+
+    // Detect delimiter in numeric lines
+    const sample = numericLines[0];
+    const delim = /,/.test(sample) ? ',' : /\t/.test(sample) ? '\t' : /;/.test(sample) ? ';' : ' ';
+    const rows = numericLines.map(l => l.split(new RegExp('[\\s' + (delim === ' ' ? '' : delim) + ']+'))
+      .filter(p => p.trim() !== ''));
+    const maxCols = Math.max(...rows.map(r=>r.length));
+    importedHeaders = Array.from({length: maxCols}, (_,i) => `PDF_Col_${i+1}`);
+    importedRaw = rows.map(r => { while(r.length < maxCols) r.push('0'); return r; });
+    finaliseImport(`PDF — ${numericLines.length} numeric rows extracted`);
+  } catch(e) {
+    setImportStatus('err','✗ PDF parsing failed: ' + e.message);
+  }
+}
+
+// ── Post-parse ─────────────────────────────────────────────────────────────
+function finaliseImport(typeLabel) {
+  if (!importedRaw.length) { setImportStatus('err','✗ No data rows found.'); return; }
+  buildDefaultMapping();
+  buildEEGWindows();
+  setImportStatus('ok',
+    `✓ Loaded: ${importedFileName} — ${importedRaw.length} rows × ${importedHeaders.length} cols`
+  );
+  document.getElementById('preview-btn').disabled = false;
+  document.getElementById('inject-btn').disabled  = false;
+  addLog(`[IMPORT] ${typeLabel} — ${importedRaw.length} rows, ${importedHeaders.length} cols`, 'info');
+}
+
+// ── Auto-detect column mapping (match header names to CH_NAMES) ─────────────
+function buildDefaultMapping() {
+  columnMapping = {};
+  // Try to match header names to channel names
+  CH_NAMES.forEach((ch, ci) => {
+    const idx = importedHeaders.findIndex(h =>
+      h.toString().toLowerCase().replace(/[\s\-_]/g,'') ===
+      ch.toLowerCase().replace(/[\s\-_]/g,'')
+    );
+    if (idx !== -1) columnMapping[ci] = idx;
+  });
+  // If no matches, map first N_CH columns sequentially
+  if (Object.keys(columnMapping).length === 0) {
+    const numericCols = importedHeaders
+      .map((h,i) => ({ h, i }))
+      .filter(({h,i}) => {
+        const sample = importedRaw.slice(0,5).map(r => parseFloat(r[i]));
+        return sample.some(v => !isNaN(v));
+      })
+      .map(({i}) => i);
+    for (let c = 0; c < Math.min(N_CH, numericCols.length); c++) {
+      columnMapping[c] = numericCols[c];
+    }
+  }
+}
+
+// ── Build EEG windows from raw rows ──────────────────────────────────────────
+function buildEEGWindows() {
+  importedEEGWindows = [];
+  currentWindowIdx = 0;
+  const nRows = importedRaw.length;
+  // Each window = N_T rows (256 samples), N_CH channels
+  const windowSize = Math.min(N_T, nRows);
+  const step = Math.max(1, Math.floor(windowSize / 2)); // 50% overlap
+
+  for (let start = 0; start + windowSize <= nRows; start += step) {
+    const window = [];
+    for (let ch = 0; ch < N_CH; ch++) {
+      const colIdx = columnMapping[ch];
+      const chData = [];
+      for (let s = start; s < start + windowSize; s++) {
+        const val = colIdx !== undefined ? parseFloat(importedRaw[s][colIdx]) : 0;
+        chData.push(isNaN(val) ? 0 : val);
+      }
+      // Pad to N_T if shorter
+      while (chData.length < N_T) chData.push(chData[chData.length-1] || 0);
+      window.push(chData.slice(0, N_T));
+    }
+    importedEEGWindows.push(window);
+  }
+
+  // Also build a single merged window if total rows < N_T
+  if (!importedEEGWindows.length) {
+    const window = [];
+    for (let ch = 0; ch < N_CH; ch++) {
+      const colIdx = columnMapping[ch];
+      const chData = importedRaw.map(r => {
+        const v = colIdx !== undefined ? parseFloat(r[colIdx]) : 0;
+        return isNaN(v) ? 0 : v;
+      });
+      while (chData.length < N_T) chData.push(0);
+      window.push(chData.slice(0, N_T));
+    }
+    importedEEGWindows.push(window);
+  }
+}
+
+// ── Status helper ─────────────────────────────────────────────────────────────
+function setImportStatus(type, msg) {
+  const el = document.getElementById('import-status');
+  el.className = 'import-status ' + type;
+  el.textContent = msg;
+}
+
+// ── Modal open/close ─────────────────────────────────────────────────────────
+function openPreviewModal() {
+  if (!importedRaw.length) return;
+  renderModalSummary();
+  renderDataTable();
+  renderColMapping();
+  renderLivePreviewCanvas();
+  document.getElementById('modal-row-info').textContent =
+    `${importedEEGWindows.length} window(s) of ${N_T} samples available`;
+  document.getElementById('preview-modal').classList.add('open');
+  switchTab('tab-table', document.querySelector('.tab-btn'));
+}
+function closePreviewModal() {
+  document.getElementById('preview-modal').classList.remove('open');
+}
+
+// ── Summary chips ─────────────────────────────────────────────────────────────
+function renderModalSummary() {
+  const mapped = Object.keys(columnMapping).length;
+  const wins = importedEEGWindows.length;
+  document.getElementById('modal-summary').innerHTML = `
+    <span class="summary-chip">${importedFileName}</span>
+    <span class="summary-chip">${importedRaw.length} rows</span>
+    <span class="summary-chip">${importedHeaders.length} columns</span>
+    <span class="summary-chip green">${mapped}/${N_CH} channels mapped</span>
+    <span class="summary-chip ${wins > 0 ? 'green':'warn'}">${wins} window(s) ready</span>
+  `;
+}
+
+// ── Render data table ─────────────────────────────────────────────────────────
+function renderDataTable() {
+  const displayRows = importedRaw.slice(0, 100);
+  const colCount = importedHeaders.length;
+  let html = '<div class="data-table-wrap"><table class="data-table"><thead><tr>';
+  html += '<th>#</th>';
+  importedHeaders.forEach(h => html += `<th>${h}</th>`);
+  html += '</tr></thead><tbody>';
+  displayRows.forEach((row, ri) => {
+    html += `<tr><td style="color:var(--muted)">${ri+1}</td>`;
+    for (let c = 0; c < colCount; c++) {
+      const val = row[c] !== undefined ? row[c] : '';
+      const isNum = !isNaN(parseFloat(val)) && val !== '';
+      html += `<td style="${isNum ? 'color:var(--accent)' : ''}">${val}</td>`;
+    }
+    html += '</tr>';
+  });
+  html += '</tbody></table></div>';
+  if (importedRaw.length > 100) {
+    html += `<div style="font-size:.62rem;color:var(--muted);margin-top:.4rem">Showing first 100 of ${importedRaw.length} rows</div>`;
+  }
+  document.getElementById('table-wrap').innerHTML = html;
+}
+
+// ── Column mapping UI ─────────────────────────────────────────────────────────
+function renderColMapping() {
+  const colOptions = ['(none)', ...importedHeaders].map((h,i) =>
+    `<option value="${i-1}">${i === 0 ? '— none —' : h}</option>`
+  ).join('');
+
+  let html = '';
+  for (let c = 0; c < N_CH; c++) {
+    const mapped = columnMapping[c] !== undefined ? columnMapping[c] : -1;
+    html += `
+      <div class="col-map-grid">
+        <span style="font-size:.65rem;color:var(--inter)">${CH_NAMES[c]}</span>
+        <span class="col-arrow">←</span>
+        <select onchange="updateMapping(${c}, this.value)" style="font-size:.65rem">
+          ${colOptions.replace(`value="${mapped}"`, `value="${mapped}" selected`)}
+        </select>
+      </div>`;
+  }
+  document.getElementById('col-map-container').innerHTML = html;
+}
+
+function updateMapping(chIdx, colVal) {
+  const v = parseInt(colVal);
+  if (v === -1) delete columnMapping[chIdx];
+  else columnMapping[chIdx] = v;
+  buildEEGWindows();
+  document.getElementById('modal-row-info').textContent =
+    `${importedEEGWindows.length} window(s) of ${N_T} samples available`;
+  renderModalSummary();
+}
+
+// ── Live preview canvas ───────────────────────────────────────────────────────
+function renderLivePreviewCanvas() {
+  if (!importedEEGWindows.length) return;
+  const canvas = document.getElementById('preview-canvas');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.offsetWidth || 700, H = 220;
+  canvas.width = W; canvas.height = H;
+  ctx.fillStyle = '#111820';
+  ctx.fillRect(0,0,W,H);
+  const data = importedEEGWindows[0];
+  const trackH = H / N_CH;
+  data.forEach((ch, ci) => {
+    const y0 = ci * trackH + trackH/2;
+    const mn = Math.min(...ch), mx = Math.max(...ch);
+    const range = (mx - mn) || 1;
+    ctx.beginPath();
+    ctx.strokeStyle = `rgba(0,212,255,${0.3 + 0.5*(ci/N_CH)})`;
+    ctx.lineWidth = 0.8;
+    ch.forEach((v, i) => {
+      const x = i / N_T * W;
+      const y = y0 - ((v - mn) / range - 0.5) * trackH * 0.7;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(0,212,255,.35)';
+    ctx.font = '7px JetBrains Mono';
+    ctx.fillText(CH_NAMES[ci], 3, y0 - trackH * 0.28 + 3);
+  });
+}
+
+// ── Tab switcher ──────────────────────────────────────────────────────────────
+function switchTab(id, btn) {
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  if (btn) btn.classList.add('active');
+  if (id === 'tab-live') { setTimeout(renderLivePreviewCanvas, 50); }
+}
+
+// ── Confirm and inject ────────────────────────────────────────────────────────
+function confirmImport() {
+  closePreviewModal();
+  injectImportedData();
+}
+
+function injectImportedData() {
+  if (!importedEEGWindows.length) {
+    addLog('[IMPORT] No windows to inject','warn');
+    return;
+  }
+  stopStream(); // stop any running stream
+
+  // Inject the first window immediately
+  injectNextWindow();
+  addLog(`[IMPORT] Injected ${importedEEGWindows.length} window(s) from "${importedFileName}"`, 'ok');
+  addLog(`[IMPORT] Use "Auto-stream" to cycle through all ${importedEEGWindows.length} window(s)`, 'info');
+
+  // Hijack the stream to use imported data
+  streamTimer = setInterval(() => {
+    injectNextWindow();
+  }, 600);
+}
+
+function injectNextWindow() {
+  if (!importedEEGWindows.length) return;
+  const data = importedEEGWindows[currentWindowIdx % importedEEGWindows.length];
+  currentWindowIdx++;
+
+  // Determine signal type from data stats
+  const flatData = data.flat();
+  const mean = flatData.reduce((a,b)=>a+b,0) / flatData.length;
+  const rms = Math.sqrt(flatData.reduce((s,v)=>s+(v-mean)**2,0)/flatData.length);
+
+  // Draw waveform with imported data
+  const guessIctal = rms > 50; // heuristic: high amplitude = ictal
+  document.getElementById('sig-label').textContent = `FILE:${currentWindowIdx}/${importedEEGWindows.length}`;
+  document.getElementById('sig-label').style.background = 'rgba(255,183,0,.1)';
+  document.getElementById('sig-label').style.borderColor = 'rgba(255,183,0,.3)';
+  document.getElementById('sig-label').style.color = 'var(--warn)';
+
+  drawEEG(data, guessIctal);
+
+  // Run inference with injected data
+  const mode = document.getElementById('backend-mode').value;
+  (async () => {
+    let result;
+    try {
+      result = mode === 'api' ? await liveInferenceData(data) : mockInferenceData(data);
+    } catch(e) {
+      result = mockInferenceData(data);
+    }
+    windows++;
+    allPictal.push(result.pIctal);
+    allLabels.push(result.isIctal);
+    updatePredUI(result, data);
+    addLog(
+      `[FILE w${currentWindowIdx}] P(ictal)=${(result.pIctal*100).toFixed(1)}% rms=${rms.toFixed(2)}`,
+      result.isIctal ? 'err' : 'ok'
+    );
+  })();
+}
+
+// ── Inference variants that accept external data arrays ──────────────────────
+function mockInferenceData(data) {
+  const t0 = performance.now();
+  let power = 0;
+  data.forEach(ch => {
+    const mean = ch.reduce((a,b)=>a+b,0)/ch.length;
+    const rms = Math.sqrt(ch.reduce((s,v)=>s+(v-mean)**2,0)/ch.length);
+    power += rms;
+  });
+  power /= N_CH;
+
+  // Normalise power to 0-1 range relative to typical EEG amplitudes
+  const normPower = Math.min(1, power / 100);
+  const noise = 0.08 * (Math.random() - .5);
+  let pIctal = Math.min(.98, Math.max(.02, 0.15 + normPower * 0.7 + noise));
+
+  const pInter = 1 - pIctal;
+  const isIctal = pIctal > 0.5;
+
+  const attn = Array.from({length:N_CH}, (_,i) =>
+    Array.from({length:N_CH}, (_,j) => {
+      if (i===j) return 0;
+      const dist = Math.abs(i-j);
+      let base = isIctal ? (0.08 - dist*0.003) : (0.04 - dist*0.001);
+      base = Math.max(0, base) + (Math.random()*0.02);
+      if (isIctal && ((i<4&&j>12&&j<16)||(j<4&&i>12&&i<16))) base += 0.06 + Math.random()*0.04;
+      return Math.max(0, base);
+    })
+  );
+  attn.forEach(row => {
+    const s = row.reduce((a,b)=>a+b,0) || 1;
+    row.forEach((_,j) => row[j] /= s);
+  });
+
+  const ms = Math.round(performance.now() - t0 + 6 + Math.random()*8);
+  return {pIctal, pInter, attn, ms, isIctal};
+}
+
+async function liveInferenceData(data) {
+  const url = 'http://localhost:3000/predict';
+  const t0 = performance.now();
+  const res = await fetch(url, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({eeg: data})
+  });
+  const j = await res.json();
+  const ms = Math.round(performance.now() - t0);
+  let attn = Array.from({length:22},()=>Array(22).fill(0));
+  if (j.requestId) {
+    try {
+      const ar = await fetch(`http://localhost:3000/attention/${j.requestId}`);
+      const aj = await ar.json();
+      if (aj.attentionLayer1) attn = aj.attentionLayer1;
+    } catch(e){}
+  }
+  return {pIctal:j.probabilities.ictal, pInter:j.probabilities.interictal, attn, ms, isIctal:j.prediction==='ictal'};
+}
+
+// ── Stop stream must also reset file injection label ─────────────────────────
+const _origStopStream = stopStream;
+function stopStream() {
+  if (streamTimer) { clearInterval(streamTimer); streamTimer = null; addLog('Stream stopped','warn'); }
+  // Reset sig label back to normal if it was showing file mode
+  const lbl = document.getElementById('sig-label');
+  if (lbl && lbl.textContent.startsWith('FILE:')) {
+    lbl.textContent = 'INTERICTAL';
+    lbl.style.background = 'rgba(0,212,255,.1)';
+    lbl.style.borderColor = 'rgba(0,212,255,.3)';
+    lbl.style.color = 'var(--accent)';
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ── SEIZURE PROBABILITY TIMELINE — Subject 01 CHB-MIT simulation ─────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Full 10-min timeline: 600 seconds, sampled every 2s = 300 points
+// Based on CHB-MIT chb01 pre-ictal characteristics:
+//   0-3 min   : stable baseline (broadband noise, alpha/beta)
+//   3-5 min   : early pre-ictal buildup (subtle 3Hz SWD emergence)
+//   5-7 min   : late pre-ictal (power surge, spreading activity)
+//   7-8.5 min : ictal onset (fast 12Hz recruiting rhythm)
+//   8.5-10min : sustained ictal (high-amplitude 6Hz SWD, full channel spread)
+
+const TL_DURATION = 600;  // 10 min in seconds
+const TL_STEP     = 2;    // sample every 2s
+const TL_POINTS   = TL_DURATION / TL_STEP; // 300
+
+let tlRunning   = false;
+let tlTimer     = null;
+let tlIdx       = 0;            // current position (0–299)
+let tlHistory   = [];           // recorded p(ictal) values so far
+let tlAnimFrame = null;
+
+// ── Generate realistic ground-truth p(ictal) curve for Subject 01 ──────────
+function generateSub01Curve() {
+  const curve = [];
+  for (let i = 0; i < TL_POINTS; i++) {
+    const sec = i * TL_STEP;
+    let p;
+    if (sec < 60) {
+      // Very stable baseline with micro-fluctuations
+      p = 0.04 + 0.03 * Math.sin(sec * 0.15) + 0.02 * (Math.random() - .5);
+    } else if (sec < 180) {
+      // Baseline — slight alpha rhythm detection
+      p = 0.05 + 0.04 * Math.sin(sec * 0.12) + 0.025 * (Math.random() - .5);
+    } else if (sec < 240) {
+      // Early pre-ictal: subtle 3Hz SWD start, gradual rise
+      const prog = (sec - 180) / 60;
+      p = 0.06 + prog * 0.12 + 0.04 * Math.sin(sec * 0.3) + 0.03 * (Math.random() - .5);
+    } else if (sec < 300) {
+      // Pre-ictal: 3Hz SWD strengthening, occasional spikes
+      const prog = (sec - 240) / 60;
+      const spike = Math.random() > 0.85 ? 0.18 * Math.random() : 0;
+      p = 0.18 + prog * 0.15 + 0.06 * Math.sin(sec * 0.5) + spike + 0.03 * (Math.random() - .5);
+    } else if (sec < 360) {
+      // Late pre-ictal: power spreading to frontal-temporal
+      const prog = (sec - 300) / 60;
+      const burst = Math.random() > 0.75 ? 0.12 + 0.15 * Math.random() : 0;
+      p = 0.33 + prog * 0.22 + 0.08 * Math.sin(sec * 0.8) + burst + 0.04 * (Math.random() - .5);
+    } else if (sec < 420) {
+      // Pre-ictal → onset transition: rapid acceleration
+      const prog = (sec - 360) / 60;
+      const burst = Math.random() > 0.65 ? 0.15 + 0.2 * Math.random() : 0;
+      p = 0.55 + prog * 0.28 + 0.1 * Math.sin(sec * 1.2) + burst + 0.04 * (Math.random() - .5);
+    } else if (sec < 450) {
+      // Ictal onset: 12Hz recruiting rhythm, probability spikes rapidly
+      const prog = (sec - 420) / 30;
+      p = 0.83 + prog * 0.12 + 0.05 * Math.sin(sec * 2.0) + 0.03 * (Math.random() - .5);
+    } else if (sec < 510) {
+      // Full ictal: sustained high probability
+      p = 0.94 + 0.05 * Math.sin(sec * 3.0) + 0.03 * (Math.random() - .5);
+    } else if (sec < 540) {
+      // Ictal peak: max activity
+      p = 0.97 + 0.025 * Math.sin(sec * 4.0) + 0.015 * (Math.random() - .5);
+    } else {
+      // Sustained ictal (6Hz SWD) until end of snippet
+      p = 0.95 + 0.04 * Math.sin(sec * 2.5) + 0.025 * (Math.random() - .5);
+    }
+    curve.push(Math.max(0.01, Math.min(0.99, p)));
+  }
+  return curve;
+}
+
+const TL_CURVE = generateSub01Curve();
+
+// ── EEG signal matching each phase ──────────────────────────────────────────
+function makePhaseSignal(tlPointIdx) {
+  const sec = tlPointIdx * TL_STEP;
+  let type, amp, freq, noiseLevel;
+
+  if (sec < 180) {
+    type = 'baseline'; amp = 0.8; freq = 10; noiseLevel = 0.6; // alpha
+  } else if (sec < 300) {
+    type = 'preictal_early'; amp = 1.4; freq = 3; noiseLevel = 0.5;
+  } else if (sec < 420) {
+    type = 'preictal_late'; amp = 2.2; freq = 3; noiseLevel = 0.45;
+  } else if (sec < 450) {
+    type = 'onset'; amp = 3.5; freq = 12; noiseLevel = 0.3;
+  } else {
+    type = 'ictal'; amp = 4.5; freq = 6; noiseLevel = 0.25;
+  }
+
+  const nCh = N_CH;
+  const data = [];
+  for (let c = 0; c < nCh; c++) {
+    const row = [];
+    const phase = Math.random() * Math.PI * 2;
+    const spread = type === 'ictal' ? 1 : type === 'onset' ? 0.85 : (c < 8 ? 0.9 : 0.4);
+    for (let i = 0; i < N_T; i++) {
+      let v = noiseLevel * (Math.random() - .5) * 2;
+      v += amp * spread * Math.sin(2 * Math.PI * freq * t[i] + phase);
+      if (type === 'preictal_late' || type === 'ictal') {
+        // add harmonic
+        v += (amp * 0.3) * spread * Math.sin(2 * Math.PI * (freq * 2) * t[i] + phase * 1.3);
+      }
+      if (type === 'onset') {
+        // recruiting rhythm sweep
+        const f = freq + (i / N_T) * 4;
+        v += (amp * 0.4) * Math.sin(2 * Math.PI * f * t[i] + phase);
+      }
+      row.push(v);
+    }
+    data.push(row);
+  }
+  return { data, isIctal: type === 'ictal' || type === 'onset', type };
+}
+
+// ── Canvas references ────────────────────────────────────────────────────────
+let tlCanvas, tlCtx, rhythmCanvas, rhythmCtx;
+
+function initTimelineCanvases() {
+  tlCanvas = document.getElementById('prob-timeline-canvas');
+  tlCtx    = tlCanvas.getContext('2d');
+  rhythmCanvas = document.getElementById('rhythm-strip-canvas');
+  rhythmCtx    = rhythmCanvas.getContext('2d');
+}
+
+// ── Draw the probability timeline ─────────────────────────────────────────────
+function drawTimeline() {
+  if (!tlCanvas) return;
+  const W = tlCanvas.offsetWidth || 420;
+  const H = 130;
+  tlCanvas.width = W; tlCanvas.height = H;
+  const ctx = tlCtx;
+
+  ctx.fillStyle = '#0d1318';
+  ctx.fillRect(0, 0, W, H);
+
+  // Phase background bands
+  const bands = [
+    { start: 0,   end: 0.3,  color: 'rgba(0,229,160,0.04)' },   // baseline 0-3min
+    { start: 0.3, end: 0.7,  color: 'rgba(255,183,0,0.05)' },   // pre-ictal 3-7min
+    { start: 0.7, end: 1.0,  color: 'rgba(255,77,109,0.08)' },  // ictal 7-10min
+  ];
+  bands.forEach(b => {
+    ctx.fillStyle = b.color;
+    ctx.fillRect(b.start * W, 0, (b.end - b.start) * W, H);
+  });
+
+  // Phase dividers
+  [0.3, 0.7].forEach(x => {
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3,4]);
+    ctx.beginPath(); ctx.moveTo(x*W, 0); ctx.lineTo(x*W, H); ctx.stroke();
+  });
+  ctx.setLineDash([]);
+
+  // Threshold line at 0.85
+  const threshY = H - 0.85 * H * 0.88 - H * 0.06;
+  ctx.strokeStyle = 'rgba(255,77,109,0.35)';
+  ctx.lineWidth = 0.8;
+  ctx.setLineDash([4,3]);
+  ctx.beginPath(); ctx.moveTo(0, threshY); ctx.lineTo(W, threshY); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = 'rgba(255,77,109,0.5)';
+  ctx.font = '8px JetBrains Mono';
+  ctx.fillText('0.85', W - 26, threshY - 2);
+
+  // Y-axis grid
+  [0, 0.25, 0.5, 0.75, 1.0].forEach(v => {
+    const y = H - v * H * 0.88 - H * 0.06;
+    ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+    ctx.lineWidth = 0.5;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,0.2)';
+    ctx.font = '7px JetBrains Mono';
+    ctx.fillText((v * 100).toFixed(0) + '%', 2, y - 1);
+  });
+
+  // Ground-truth shaded area (full curve, muted)
+  ctx.beginPath();
+  TL_CURVE.forEach((p, i) => {
+    const x = (i / TL_POINTS) * W;
+    const y = H - p * H * 0.88 - H * 0.06;
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath();
+  ctx.fillStyle = 'rgba(0,212,255,0.05)';
+  ctx.fill();
+
+  // History line (animated, coloured by phase)
+  if (tlHistory.length > 1) {
+    // Draw filled area under history
+    ctx.beginPath();
+    tlHistory.forEach((p, i) => {
+      const x = (i / TL_POINTS) * W;
+      const y = H - p * H * 0.88 - H * 0.06;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    const lastX = ((tlHistory.length - 1) / TL_POINTS) * W;
+    ctx.lineTo(lastX, H); ctx.lineTo(0, H); ctx.closePath();
+
+    // Gradient fill
+    const grad = ctx.createLinearGradient(0, 0, W, 0);
+    grad.addColorStop(0,    'rgba(0,229,160,0.15)');
+    grad.addColorStop(0.3,  'rgba(0,229,160,0.12)');
+    grad.addColorStop(0.6,  'rgba(255,183,0,0.15)');
+    grad.addColorStop(0.85, 'rgba(255,77,109,0.2)');
+    grad.addColorStop(1,    'rgba(255,77,109,0.3)');
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Stroke line
+    ctx.beginPath();
+    tlHistory.forEach((p, i) => {
+      const x = (i / TL_POINTS) * W;
+      const y = H - p * H * 0.88 - H * 0.06;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    const lineGrad = ctx.createLinearGradient(0, 0, W, 0);
+    lineGrad.addColorStop(0,    '#00e5a0');
+    lineGrad.addColorStop(0.42, '#ffb700');
+    lineGrad.addColorStop(0.72, '#ff4d6d');
+    lineGrad.addColorStop(1,    '#ff4d6d');
+    ctx.strokeStyle = lineGrad;
+    ctx.lineWidth = 1.8;
+    ctx.stroke();
+
+    // Live cursor dot
+    const ci = tlHistory.length - 1;
+    const cx = (ci / TL_POINTS) * W;
+    const cy = H - tlHistory[ci] * H * 0.88 - H * 0.06;
+    const currentP = tlHistory[ci];
+    const dotColor = currentP > 0.85 ? '#ff4d6d' : currentP > 0.5 ? '#ffb700' : '#00e5a0';
+    ctx.beginPath();
+    ctx.arc(cx, cy, 4, 0, Math.PI * 2);
+    ctx.fillStyle = dotColor;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(cx, cy, 7, 0, Math.PI * 2);
+    ctx.strokeStyle = dotColor + '55';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+
+  // Time axis labels
+  ctx.fillStyle = 'rgba(255,255,255,0.22)';
+  ctx.font = '7px JetBrains Mono';
+  [0,2,4,6,8,10].forEach(min => {
+    const x = (min / 10) * W;
+    ctx.fillText(`${min}m`, x + 2, H - 2);
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    ctx.lineWidth = 0.5;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+  });
+}
+
+// ── Draw rhythm strip (5-channel mini EEG) ───────────────────────────────────
+function drawRhythmStrip(eegData, isIctal) {
+  if (!rhythmCanvas) return;
+  const W = rhythmCanvas.offsetWidth || 420;
+  const H = 44;
+  rhythmCanvas.width = W; rhythmCanvas.height = H;
+  const ctx = rhythmCtx;
+  ctx.fillStyle = '#0d1318';
+  ctx.fillRect(0, 0, W, H);
+
+  // Draw 5 representative channels
+  const chIndices = [0, 4, 8, 13, 16];
+  const trackH = H / chIndices.length;
+  chIndices.forEach((ci, ri) => {
+    const ch = eegData[ci];
+    const y0 = ri * trackH + trackH / 2;
+    const mn = Math.min(...ch), mx = Math.max(...ch);
+    const range = (mx - mn) || 1;
+    const color = isIctal
+      ? `rgba(255,77,109,${0.45 + 0.4 * (ri / chIndices.length)})`
+      : `rgba(0,212,255,${0.3 + 0.4 * (ri / chIndices.length)})`;
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 0.7;
+    ch.forEach((v, i) => {
+      const x = (i / N_T) * W;
+      const y = y0 - ((v - mn) / range - 0.5) * trackH * 0.72;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  });
+}
+
+// ── Timeline control ──────────────────────────────────────────────────────────
+function toggleTimeline() {
+  if (tlRunning) {
+    pauseTimeline();
+  } else {
+    startTimeline();
+  }
+}
+
+function startTimeline() {
+  if (!tlCanvas) initTimelineCanvases();
+  tlRunning = true;
+  document.getElementById('timeline-play-btn').textContent = '⏸ PAUSE';
+  addLog('[SUBJECT 01] Transformer baseline loaded — replaying 10-min pre-ictal→ictal', 'info');
+  addLog('[SUBJECT 01] CHB-MIT chb01: seizure onset ~7:30 min', 'warn');
+  tlTimer = setInterval(stepTimeline, TL_STEP * 1000 / 15); // 15× real-time for demo
+}
+
+function pauseTimeline() {
+  tlRunning = false;
+  clearInterval(tlTimer);
+  document.getElementById('timeline-play-btn').textContent = '▶ PLAY';
+}
+
+function resetTimeline() {
+  pauseTimeline();
+  tlIdx = 0;
+  tlHistory = [];
+  drawTimeline();
+}
+
+function stepTimeline() {
+  if (tlIdx >= TL_POINTS) {
+    pauseTimeline();
+    addLog('[SUBJECT 01] Replay complete — 10 min snippet finished', 'ok');
+    document.getElementById('timeline-play-btn').textContent = '↺ REPLAY';
+    document.getElementById('timeline-play-btn').onclick = () => { tlIdx=0; tlHistory=[]; startTimeline(); };
+    return;
+  }
+
+  const p = TL_CURVE[tlIdx];
+  tlHistory.push(p);
+
+  const sec = tlIdx * TL_STEP;
+  const mins = Math.floor(sec / 60);
+  const secs = sec % 60;
+  document.getElementById('tl-elapsed').textContent = `${mins}:${String(secs).padStart(2,'0')}`;
+  document.getElementById('tl-pictal-now').textContent = (p * 100).toFixed(1) + '%';
+  document.getElementById('tl-pictal-now').style.color =
+    p > 0.85 ? 'var(--ictal)' : p > 0.5 ? 'var(--warn)' : 'var(--accent)';
+
+  // Phase label
+  let phase, phaseColor;
+  if (sec < 180) { phase = 'Baseline'; phaseColor = 'var(--inter)'; }
+  else if (sec < 300) { phase = 'Pre-ictal'; phaseColor = 'var(--warn)'; }
+  else if (sec < 420) { phase = 'Late pre-ictal'; phaseColor = 'var(--warn)'; }
+  else if (sec < 450) { phase = 'Ictal onset'; phaseColor = 'var(--ictal)'; }
+  else { phase = 'Sustained ictal'; phaseColor = 'var(--ictal)'; }
+  document.getElementById('tl-phase').textContent = phase;
+  document.getElementById('tl-phase').style.color = phaseColor;
+
+  // Timeline badge
+  const badge = document.getElementById('timeline-badge');
+  if (sec < 180) {
+    badge.textContent = '● BASELINE'; badge.style.color='var(--inter)'; badge.style.borderColor='rgba(0,229,160,.3)'; badge.style.background='rgba(0,229,160,.08)';
+  } else if (sec < 420) {
+    badge.textContent = '⚡ PRE-ICTAL'; badge.style.color='var(--warn)'; badge.style.borderColor='rgba(255,183,0,.3)'; badge.style.background='rgba(255,183,0,.08)';
+  } else {
+    badge.textContent = '🔴 ICTAL'; badge.style.color='var(--ictal)'; badge.style.borderColor='rgba(255,77,109,.4)'; badge.style.background='rgba(255,77,109,.12)';
+  }
+
+  // Generate matching EEG signal
+  const { data, isIctal, type } = makePhaseSignal(tlIdx);
+
+  // Update main EEG waveform
+  document.getElementById('sig-label').textContent = phase.toUpperCase();
+  document.getElementById('sig-label').style.color  = phaseColor;
+  document.getElementById('sig-label').style.background = isIctal ? 'rgba(255,77,109,.12)' : 'rgba(0,212,255,.1)';
+  document.getElementById('sig-label').style.borderColor = isIctal ? 'rgba(255,77,109,.3)' : 'rgba(0,212,255,.3)';
+  drawEEG(data, isIctal);
+
+  // Rhythm strip
+  drawRhythmStrip(data, isIctal);
+
+  // Push to main inference system
+  const result = mockInferenceData(data);
+  // Override with ground-truth p(ictal) from our realistic curve
+  result.pIctal = p;
+  result.pInter = 1 - p;
+  result.isIctal = p > 0.5;
+
+  windows++;
+  allPictal.push(result.pIctal);
+  allLabels.push(result.isIctal);
+  updatePredUI(result, data);
+
+  if (p > 0.85 && (p > (tlHistory[tlHistory.length-2]||0) + 0.05)) {
+    addLog(`[SUBJ01 t=${mins}:${String(secs).padStart(2,'0')}] ⚡ SEIZURE ONSET — P(ictal)=${(p*100).toFixed(1)}%`, 'err');
+  } else if (tlIdx % 10 === 0) {
+    addLog(`[SUBJ01 t=${mins}:${String(secs).padStart(2,'0')}] ${phase} — P(ictal)=${(p*100).toFixed(1)}%`, isIctal?'err':'ok');
+  }
+
+  drawTimeline();
+  tlIdx++;
+}
+
+// ── Auto-init canvases on load ────────────────────────────────────────────────
+window.addEventListener('load', () => {
+  initTimelineCanvases();
+  drawTimeline();
+});
+</script>
+</body>
+</html>
