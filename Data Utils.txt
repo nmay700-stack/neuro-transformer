@@ -1,0 +1,340 @@
+"""
+data_utils.py
+=============
+MNE-based preprocessing pipeline for CHB-MIT .edf files.
+
+Grounded in the real chb01-summary.txt format:
+  - 256 Hz sampling rate
+  - 23 channels listed (channel 23 = T8-P8, duplicate of channel 15)
+  - Seizure times stored as "Seizure Start Time: XXXX seconds"
+
+Key pipeline steps
+------------------
+1.  Load .edf  →  MNE Raw
+2.  Drop channel 23 (T8-P8 duplicate) → keep exactly 22 channels
+3.  Notch filter  50 Hz  (Indian / European power-line)
+4.  Bandpass      1–40 Hz (zero-phase FIR)
+5.  Z-score normalise per channel
+6.  Segment into 1-second overlapping windows
+7.  Assign binary labels from summary file seizure timestamps
+"""
+
+import re
+import logging
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import mne
+import numpy as np
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+import torch
+
+mne.set_log_level("WARNING")
+log = logging.getLogger(__name__)
+
+# ── CHB-MIT channel list (22 channels; channel 23 T8-P8 is dropped) ──────────
+CHB_MIT_22_CHANNELS = [
+    "FP1-F7", "F7-T7",   "T7-P7",   "P7-O1",
+    "FP1-F3", "F3-C3",   "C3-P3",   "P3-O1",
+    "FP2-F4", "F4-C4",   "C4-P4",   "P4-O2",
+    "FP2-F8", "F8-T8",   "T8-P8",   "P8-O2",
+    "FZ-CZ",  "CZ-PZ",
+    "P7-T7",  "T7-FT9",  "FT9-FT10","FT10-T8",
+]
+# Note: The summary file lists T8-P8 TWICE (channels 15 & 23).
+# We keep the first occurrence and drop the second.
+
+SFREQ     = 256
+WIN_SEC   = 1.0
+WIN_SAMP  = int(SFREQ * WIN_SEC)   # 256
+
+
+# ── 1. Summary file parser (matches real chb01-summary.txt format) ────────────
+
+def parse_summary(summary_path: str | Path) -> Dict[str, List[Tuple[float, float]]]:
+    """
+    Parse a CHB-MIT *-summary.txt file into a dict of seizure intervals.
+
+    Handles the exact format of the uploaded chb01-summary.txt:
+        File Name: chb01_03.edf
+        ...
+        Seizure Start Time: 2996 seconds
+        Seizure End Time: 3036 seconds
+
+    Args:
+        summary_path : path to e.g. data/chb01/chb01-summary.txt
+
+    Returns:
+        dict  {edf_filename: [(onset_sec, offset_sec), ...]}
+
+    Example (from chb01-summary.txt):
+        >>> s = parse_summary("chb01-summary.txt")
+        >>> s["chb01_03.edf"]
+        [(2996.0, 3036.0)]
+        >>> s["chb01_21.edf"]
+        [(327.0, 420.0)]
+    """
+    summary_path = Path(summary_path)
+    seizures: Dict[str, List[Tuple[float, float]]] = {}
+    current_file = None
+    pending_onset = None
+
+    with open(summary_path) as f:
+        for line in f:
+            line = line.strip()
+
+            if line.startswith("File Name:"):
+                current_file = line.split(":", 1)[1].strip()
+                seizures.setdefault(current_file, [])
+                pending_onset = None
+
+            elif "Seizure" in line and "Start Time" in line:
+                m = re.search(r"(\d+\.?\d*)\s*second", line)
+                if m:
+                    pending_onset = float(m.group(1))
+
+            elif "Seizure" in line and "End Time" in line:
+                m = re.search(r"(\d+\.?\d*)\s*second", line)
+                if m and pending_onset is not None and current_file:
+                    seizures[current_file].append((pending_onset, float(m.group(1))))
+                    pending_onset = None
+
+    total = sum(len(v) for v in seizures.values())
+    ictal_files = {k for k, v in seizures.items() if v}
+    log.info(f"Parsed summary: {total} seizures in {len(ictal_files)} files "
+             f"({len(seizures)} total files).")
+    return seizures
+
+
+# ── 2. EDF loading + filtering ────────────────────────────────────────────────
+
+def load_and_filter(edf_path: str | Path) -> mne.io.Raw:
+    """
+    Load one CHB-MIT .edf file and apply the full preprocessing chain.
+
+    Pipeline (in order):
+      load → pick 22 channels → notch 50 Hz → bandpass 1–40 Hz
+
+    Why each step exists:
+      Notch 50 Hz  : Indian/European power-line artifact removal
+                     (230V/50Hz grid; electrode leads act as antennas)
+      Bandpass 1–40: Removes DC drift (<1 Hz) and scalp EMG (>40 Hz)
+      phase='zero' : Zero-phase FIR prevents temporal smearing of seizure onset
+                     — critical for accurate label assignment during windowing
+
+    Args:
+        edf_path : path to a single .edf file
+
+    Returns:
+        mne.io.Raw : filtered, 22-channel Raw object (data in Volts)
+    """
+    raw = mne.io.read_raw_edf(str(edf_path), preload=True, verbose=False)
+
+    # Drop duplicate T8-P8 (channel 23) — keep first 22 channels
+    available = [ch for ch in CHB_MIT_22_CHANNELS if ch in raw.ch_names]
+    # deduplicate while preserving order
+    seen, unique = set(), []
+    for ch in available:
+        if ch not in seen:
+            seen.add(ch)
+            unique.append(ch)
+    if unique:
+        raw.pick_channels(unique, ordered=True)
+
+    # Resample if necessary
+    if abs(raw.info["sfreq"] - SFREQ) > 1:
+        raw.resample(SFREQ)
+
+    # ── Notch filter: 50 Hz ──────────────────────────────────────────────────
+    raw.notch_filter(freqs=50.0, method="fir", fir_window="hamming", verbose=False)
+
+    # ── Bandpass: 1–40 Hz ────────────────────────────────────────────────────
+    raw.filter(l_freq=1.0, h_freq=40.0, method="fir",
+               fir_window="hamming", phase="zero", verbose=False)
+
+    return raw
+
+
+def normalize(data: np.ndarray) -> np.ndarray:
+    """
+    Per-channel z-score normalisation.
+
+    Computed across the full recording (not per-window) so that relative
+    amplitude differences between ictal and interictal periods are preserved.
+
+    Args:
+        data : (n_channels, n_samples) in Volts
+
+    Returns:
+        (n_channels, n_samples) z-scored
+    """
+    mu  = data.mean(axis=1, keepdims=True)
+    std = data.std(axis=1, keepdims=True)
+    std = np.where(std < 1e-10, 1.0, std)
+    return (data - mu) / std
+
+
+# ── 3. Windowing + labelling ──────────────────────────────────────────────────
+
+def extract_windows(
+    data: np.ndarray,
+    seizure_intervals: List[Tuple[float, float]],
+    overlap: float = 0.5,
+    n_channels: int = 22,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Segment a continuous EEG recording into overlapping windows.
+
+    Labelling rule: a window is **ictal (1)** if its midpoint falls within
+    any seizure interval.  Using the midpoint avoids ambiguous boundary
+    windows where seizure activity has only partially begun.
+
+    Overlap = 0.5 → stride = 0.5 s → doubles the effective dataset size.
+    For a 40-second seizure (e.g. chb01_03.edf: 2996–3036 s) this yields
+    ~80 ictal windows instead of 40.
+
+    Args:
+        data              : (n_channels, n_samples) normalised EEG
+        seizure_intervals : list of (onset_sec, offset_sec)
+        overlap           : fractional window overlap [0, 1)
+        n_channels        : pad/truncate to this many channels
+
+    Returns:
+        windows : (N, n_channels, WIN_SAMP)  float32
+        labels  : (N,)                        int64   {0, 1}
+    """
+    n_samples = data.shape[1]
+    stride    = int(WIN_SAMP * (1 - overlap))
+    windows, labels = [], []
+
+    for start in range(0, n_samples - WIN_SAMP + 1, stride):
+        end     = start + WIN_SAMP
+        mid_sec = (start + WIN_SAMP / 2) / SFREQ
+
+        is_ictal = any(
+            on <= mid_sec <= off
+            for on, off in seizure_intervals
+        )
+
+        seg = data[:, start:end]
+        # Pad channels if file has fewer than 22
+        if seg.shape[0] < n_channels:
+            pad = np.zeros((n_channels - seg.shape[0], WIN_SAMP))
+            seg = np.vstack([seg, pad])
+
+        windows.append(seg[:n_channels].astype(np.float32))
+        labels.append(int(is_ictal))
+
+    if not windows:
+        return (np.empty((0, n_channels, WIN_SAMP), np.float32),
+                np.empty(0, np.int64))
+
+    return np.stack(windows), np.array(labels, np.int64)
+
+
+# ── 4. Full subject pipeline ──────────────────────────────────────────────────
+
+def process_subject(
+    subject_dir: str | Path,
+    subject_id:  str,
+    overlap:     float = 0.5,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    End-to-end pipeline for one CHB-MIT subject folder.
+
+    Reads all .edf files, applies the filter chain, windows, and labels each
+    segment using the subject's summary file.
+
+    Args:
+        subject_dir : e.g. "data/chb-mit/chb01/"
+        subject_id  : "chb01"
+        overlap     : window overlap fraction
+
+    Returns:
+        (all_windows, all_labels) concatenated across all EDF files
+    """
+    subject_dir  = Path(subject_dir)
+    summary_path = subject_dir / f"{subject_id}-summary.txt"
+    seizure_map  = parse_summary(summary_path)
+
+    all_windows, all_labels = [], []
+
+    for edf_path in sorted(subject_dir.glob("*.edf")):
+        try:
+            raw  = load_and_filter(edf_path)
+            data = raw.get_data() * 1e6      # Volts → µV
+            data = normalize(data)
+            seiz = seizure_map.get(edf_path.name, [])
+            wins, labs = extract_windows(data, seiz, overlap)
+            if len(wins):
+                all_windows.append(wins)
+                all_labels.append(labs)
+        except Exception as e:
+            log.error(f"Skipped {edf_path.name}: {e}")
+
+    if not all_windows:
+        raise RuntimeError(f"No windows extracted for {subject_id}.")
+
+    X = np.concatenate(all_windows, axis=0)
+    y = np.concatenate(all_labels,  axis=0)
+    log.info(f"{subject_id}: {X.shape[0]} windows | "
+             f"ictal={y.sum()} | interictal={len(y)-y.sum()} | "
+             f"ratio={((len(y)-y.sum())/(y.sum()+1e-6)):.0f}:1")
+    return X, y
+
+
+# ── 5. PyTorch Dataset + weighted sampler ─────────────────────────────────────
+
+class EEGDataset(Dataset):
+    """Wraps (windows, labels) arrays as a PyTorch Dataset."""
+
+    def __init__(self, windows: np.ndarray, labels: np.ndarray):
+        self.X = torch.from_numpy(windows)   # (N, 22, 256) float32
+        self.y = torch.from_numpy(labels)    # (N,)         int64
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+
+def make_loader(
+    windows:    np.ndarray,
+    labels:     np.ndarray,
+    batch_size: int  = 64,
+    train:      bool = True,
+) -> DataLoader:
+    """
+    Build a DataLoader with WeightedRandomSampler for class imbalance.
+
+    CHB-MIT seizures occupy <1% of recording time for most subjects.
+    WeightedRandomSampler ensures each mini-batch is ~50/50 ictal/interictal
+    at the data-loading level, before the weighted loss applies at the
+    gradient level — doubly-robust imbalance correction.
+
+    Args:
+        windows    : preprocessed EEG windows (N, 22, 256)
+        labels     : binary labels (N,)
+        batch_size : mini-batch size
+        train      : if True, use WeightedRandomSampler; else shuffle=False
+
+    Returns:
+        torch.utils.data.DataLoader
+    """
+    dataset = EEGDataset(windows, labels)
+
+    if train:
+        counts         = np.bincount(labels)
+        class_weights  = 1.0 / counts.astype(float)
+        sample_weights = class_weights[labels]
+        sampler        = WeightedRandomSampler(
+            torch.from_numpy(sample_weights).float(),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+        return DataLoader(dataset, batch_size=batch_size, sampler=sampler,
+                          num_workers=0, pin_memory=False)
+    else:
+        return DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                          num_workers=0)
