@@ -1,174 +1,217 @@
 """
-model.py
-========
-Transformer Encoder for 22-channel scalp EEG seizure onset prediction.
+NeuroTransformer — EEG Seizure Onset Prediction
+================================================
+Transformer encoder architecture for seizure onset detection
+from 22-channel scalp EEG (CHB-MIT PhysioNet dataset).
 
-Designed for CHB-MIT dataset (PhysioNet):
-  - Input shape : (batch, 22, 256)  — 22 channels, 256 samples @ 256 Hz = 1 second
-  - Output      : (logits, attention_maps)
+Author : Mayuri Naveen
+Affil  : SRM Institute of Science and Technology, Kattankulathur
+Dataset: CHB-MIT Scalp EEG Database (PhysioNet)
+         Subject 01 — Female, 11 yr, Focal epilepsy
+Stack  : Python 3.10+ · PyTorch 2.x · MNE-Python
 """
 
 import torch
 import torch.nn as nn
-from typing import Tuple, List
+import torch.nn.functional as F
+import numpy as np
+from typing import Optional, Tuple
 
 
-class EEGPatchEmbedding(nn.Module):
+# ── Constants ────────────────────────────────────────────────────────────────
+N_CHANNELS   = 22          # CHB-MIT bipolar montage
+SFREQ        = 256         # Hz
+WINDOW_SEC   = 1           # seconds per input window
+N_SAMPLES    = SFREQ * WINDOW_SEC  # 256 samples per window
+N_CLASSES    = 2           # interictal / ictal
+D_MODEL      = 88          # transformer embedding dim (must be divisible by N_HEADS=22)
+N_HEADS      = 22          # one head per EEG channel
+N_LAYERS     = 2           # encoder depth
+DIM_FF       = 176         # feedforward hidden dim (2×D_MODEL)
+DROPOUT      = 0.1
+THRESHOLD    = 0.85        # P(ictal) alert threshold
+
+CH_NAMES = [
+    "FP1-F7","F7-T7","T7-P7","P7-O1",
+    "FP1-F3","F3-C3","C3-P3","P3-O1",
+    "FP2-F4","F4-C4","C4-P4","P4-O2",
+    "FP2-F8","F8-T8","T8-P8","P8-O2",
+    "FZ-CZ","CZ-PZ","P7-T7","T7-FT9",
+    "FT9-FT10","FT10-T8",
+]
+
+
+# ── Channel Embedding ────────────────────────────────────────────────────────
+class ChannelEmbedding(nn.Module):
     """
-    Projects each channel's time-series (256 samples) into a d_model vector.
-
-    Neuroscience rationale: Each electrode captures a local field potential.
-    A linear projection learns a data-driven spectral summary per channel —
-    equivalent to computing bandpower features, but end-to-end differentiable.
+    Projects each EEG channel's time series (N_SAMPLES,) → (D_MODEL,)
+    using a 1-D convolution tokeniser then a linear projection.
     """
-    def __init__(self, n_timepoints: int = 256, d_model: int = 64, dropout: float = 0.1):
+    def __init__(self, n_samples: int = N_SAMPLES, d_model: int = D_MODEL):
         super().__init__()
-        self.proj    = nn.Linear(n_timepoints, d_model)
-        self.norm    = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
+        self.conv = nn.Sequential(
+            nn.Conv1d(1, 32, kernel_size=8, stride=4, padding=2),
+            nn.GELU(),
+            nn.Conv1d(32, 64, kernel_size=4, stride=2, padding=1),
+            nn.GELU(),
+        )
+        # compute flattened conv output size
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, n_samples)
+            flat  = self.conv(dummy).flatten(1).shape[1]
+        self.proj = nn.Linear(flat, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, T) → (B, C, d_model)
-        return self.dropout(self.norm(self.proj(x)))
+        # x: (B, C, T)  →  (B, C, D_MODEL)
+        B, C, T = x.shape
+        x = x.reshape(B * C, 1, T)
+        x = self.conv(x).flatten(1)
+        x = self.proj(x)
+        return x.reshape(B, C, -1)
 
 
-class LearnablePositionalEncoding(nn.Module):
-    """
-    Learnable electrode-position encoding over the 22-channel spatial dimension.
-
-    Unlike NLP, EEG channels have fixed scalp positions (10-20 system).
-    Learnable encodings let the model encode frontal/temporal/occipital
-    neighbourhoods — critical because seizures propagate along specific
-    anatomical pathways.
-    """
-    def __init__(self, n_channels: int = 22, d_model: int = 64):
+# ── Positional Encoding (channel-wise) ───────────────────────────────────────
+class ChannelPositionalEncoding(nn.Module):
+    """Learnable positional embedding for each of the 22 channels."""
+    def __init__(self, n_channels: int = N_CHANNELS, d_model: int = D_MODEL):
         super().__init__()
-        self.pe = nn.Parameter(torch.zeros(1, n_channels, d_model))
-        nn.init.trunc_normal_(self.pe, std=0.02)
+        self.pe = nn.Parameter(torch.randn(1, n_channels, d_model) * 0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.pe
 
 
+# ── Transformer Encoder ───────────────────────────────────────────────────────
 class NeuroTransformerEncoder(nn.Module):
     """
-    Full Transformer Encoder for EEG seizure onset prediction.
-
-    Architecture:
-        EEGPatchEmbedding → LearnablePositionalEncoding
-        → 2× TransformerEncoderLayer (Pre-LN, 4 heads)
-        → GlobalAveragePool → MLP classifier
-
-    Returns logits AND per-layer attention maps for heatmap visualisation.
-
-    Args:
-        n_channels   : Number of EEG electrodes (default 22 for CHB-MIT).
-        n_timepoints : Samples per window (256 @ 256 Hz = 1 s).
-        d_model      : Embedding dimension.
-        n_heads      : Attention heads (d_model must be divisible by n_heads).
-        n_layers     : Encoder depth.
-        d_ff         : Feed-forward hidden dim.
-        n_classes    : 2 (interictal / pre-ictal).
-        dropout      : Dropout rate.
+    Multi-head self-attention over EEG channels.
+    Each token = one channel's embedded time-series.
+    Attention matrix → 22×22 electrode connectivity map.
     """
     def __init__(
         self,
-        n_channels   : int   = 22,
-        n_timepoints : int   = 256,
-        d_model      : int   = 64,
-        n_heads      : int   = 4,
-        n_layers     : int   = 2,
-        d_ff         : int   = 256,
-        n_classes    : int   = 2,
-        dropout      : float = 0.1,
+        d_model:   int = D_MODEL,
+        n_heads:   int = N_HEADS,
+        n_layers:  int = N_LAYERS,
+        dim_ff:    int = DIM_FF,
+        dropout:   float = DROPOUT,
     ):
         super().__init__()
-        self.embedding = EEGPatchEmbedding(n_timepoints, d_model, dropout)
-        self.pos_enc   = LearnablePositionalEncoding(n_channels, d_model)
-
-        encoder_layer  = nn.TransformerEncoderLayer(
+        encoder_layer = nn.TransformerEncoderLayer(
             d_model         = d_model,
             nhead           = n_heads,
-            dim_feedforward = d_ff,
+            dim_feedforward = dim_ff,
             dropout         = dropout,
-            batch_first     = True,   # (B, seq, d_model)
-            norm_first      = True,   # Pre-LayerNorm for stable small-dataset training
+            activation      = "gelu",
+            batch_first     = True,
+            norm_first      = True,   # Pre-LN for training stability
         )
-        self.encoder   = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.norm      = nn.LayerNorm(d_model)
-        self.classifier = nn.Sequential(
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers = n_layers,
+            enable_nested_tensor = False,
+        )
+        self._attn_weights: Optional[torch.Tensor] = None
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # x: (B, N_CH, D_MODEL)
+        out = self.encoder(x)
+        # Approximate attention heatmap via token similarity
+        norm = F.normalize(out, dim=-1)
+        attn = torch.bmm(norm, norm.transpose(1, 2))  # (B, N_CH, N_CH)
+        self._attn_weights = attn.detach()
+        return out, attn
+
+
+# ── Classification Head ───────────────────────────────────────────────────────
+class ClassificationHead(nn.Module):
+    """
+    Aggregates channel tokens → scalar seizure probability.
+    Uses mean-pool + 2-layer MLP with dropout.
+    """
+    def __init__(self, d_model: int = D_MODEL, n_classes: int = N_CLASSES):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.mlp  = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(0.15),
             nn.Linear(d_model // 2, n_classes),
         )
-        self._init_weights()
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, N_CH, D_MODEL)
+        pooled = self.norm(x.mean(dim=1))   # mean-pool over channels
+        return self.mlp(pooled)             # (B, N_CLASSES)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+
+# ── Full NeuroTransformer ─────────────────────────────────────────────────────
+class NeuroTransformer(nn.Module):
+    """
+    End-to-end model:
+        Input  : (B, 22, 256)  — raw EEG window, z-score normalised
+        Output : (B, 2)        — logits [P_interictal, P_ictal]
+        Extras : attention heatmap (B, 22, 22)
+    """
+    def __init__(self):
+        super().__init__()
+        self.embed  = ChannelEmbedding()
+        self.pos_enc = ChannelPositionalEncoding()
+        self.encoder = NeuroTransformerEncoder()
+        self.head    = ClassificationHead()
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        tokens  = self.embed(x)          # (B, C, D)
+        tokens  = self.pos_enc(tokens)
+        enc, attn = self.encoder(tokens) # (B, C, D), (B, C, C)
+        logits  = self.head(enc)         # (B, 2)
+        return logits, attn
+
+    @torch.no_grad()
+    def predict(
+        self, x: torch.Tensor
+    ) -> dict:
         """
-        Args:
-            x : EEG tensor (B, n_channels, n_timepoints)
-        Returns:
-            logits    : (B, 2)
-            attn_maps : [] — use get_attention_maps() for interpretability
+        Single-window inference.
+        Returns dict with probabilities, prediction label, attention map.
         """
-        x = self.embedding(x)
-        x = self.pos_enc(x)
-        x = self.encoder(x)
-        x = self.norm(x)
-        x = x.mean(dim=1)           # global average pool over electrodes
-        return self.classifier(x), []
+        self.eval()
+        logits, attn = self(x)
+        probs = F.softmax(logits, dim=-1)[0]
+        p_ictal   = probs[1].item()
+        p_inter   = probs[0].item()
+        label     = "ictal" if p_ictal >= THRESHOLD else "interictal"
+        return {
+            "prediction":    label,
+            "probabilities": {"ictal": p_ictal, "interictal": p_inter},
+            "attention":     attn[0].cpu().numpy(),   # (22, 22)
+            "alert":         p_ictal >= THRESHOLD,
+        }
 
-    def get_attention_maps(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        """
-        Forward pass that extracts per-layer attention weight matrices.
-
-        The (22 × 22) attention map from the final layer quantifies how much
-        each electrode attends to every other electrode — a learned functional
-        connectivity graph. Elevated attention between temporal (T7/T8) and
-        frontal (F7/F8) electrodes during ictal prediction is consistent with
-        known MTLE propagation pathways.
-
-        Args:
-            x : EEG tensor (B, n_channels, n_timepoints)
-        Returns:
-            logits    : (B, 2)
-            attn_maps : list[(B, n_channels, n_channels)] — one per layer
-        """
-        x = self.embedding(x)
-        x = self.pos_enc(x)
-
-        attn_maps = []
-        for layer in self.encoder.layers:
-            x_norm = layer.norm1(x)
-            attn_out, attn_weights = layer.self_attn(
-                x_norm, x_norm, x_norm,
-                need_weights=True,
-                average_attn_weights=True,  # average over heads → (B, C, C)
-            )
-            x = x + layer.dropout1(attn_out)
-            x = x + layer.dropout2(
-                layer.linear2(layer.dropout(layer.activation(layer.linear1(layer.norm2(x)))))
-            )
-            attn_maps.append(attn_weights)
-
-        x = self.norm(x)
-        x = x.mean(dim=1)
-        logits = self.classifier(x)
-        return logits, attn_maps
+    def count_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-def build_model(cfg: dict = None) -> NeuroTransformerEncoder:
-    """Factory: build model from optional config dict."""
-    defaults = dict(n_channels=22, n_timepoints=256, d_model=64,
-                    n_heads=4, n_layers=2, d_ff=256, n_classes=2, dropout=0.1)
-    if cfg:
-        defaults.update(cfg)
-    return NeuroTransformerEncoder(**defaults)
+# ── Quick sanity check ────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    model = NeuroTransformer()
+    total = model.count_parameters()
+    print(f"NeuroTransformer initialised — {total:,} trainable parameters")
+
+    # Simulate one batch of 4 EEG windows
+    dummy_eeg = torch.randn(4, N_CHANNELS, N_SAMPLES)
+    logits, attn = model(dummy_eeg)
+    print(f"Logits shape   : {logits.shape}")   # (4, 2)
+    print(f"Attention shape: {attn.shape}")     # (4, 22, 22)
+
+    # Single inference
+    single_window = torch.randn(1, N_CHANNELS, N_SAMPLES)
+    result = model.predict(single_window)
+    print(f"\nSingle-window inference:")
+    print(f"  Prediction  : {result['prediction']}")
+    print(f"  P(ictal)    : {result['probabilities']['ictal']:.4f}")
+    print(f"  P(interict.): {result['probabilities']['interictal']:.4f}")
+    print(f"  Alert       : {result['alert']}")
+    print(f"  Attn shape  : {result['attention'].shape}")
