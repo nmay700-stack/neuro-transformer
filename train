@@ -1,0 +1,149 @@
+"""
+train.py — NeuroTransformer Training Loop
+==========================================
+Doubly-robust class imbalance correction:
+  1. WeightedRandomSampler — balanced batches
+  2. Inverse-frequency CrossEntropyLoss — penalises missed ictal events
+
+Author : Mayuri Naveen
+"""
+
+import argparse
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
+
+from model import NeuroTransformer, N_CHANNELS, N_SAMPLES
+from preprocessing import EEGDataset, build_chb01_dataset
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+EPOCHS      = 30
+BATCH_SIZE  = 32
+LR          = 3e-4
+WEIGHT_DECAY= 1e-4
+VAL_SPLIT   = 0.15
+DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
+SAVE_PATH   = "neurotransformer_chb01.pt"
+
+
+def train_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    total_loss, correct, n = 0.0, 0, 0
+    for X, y in loader:
+        X, y = X.to(device), y.to(device)
+        optimizer.zero_grad()
+        logits, _ = model(X)
+        loss = criterion(logits, y)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        total_loss += loss.item() * len(y)
+        correct    += (logits.argmax(1) == y).sum().item()
+        n          += len(y)
+    return total_loss / n, correct / n
+
+
+@torch.no_grad()
+def eval_epoch(model, loader, criterion, device):
+    model.eval()
+    total_loss, correct, n = 0.0, 0, 0
+    all_probs, all_labels = [], []
+    for X, y in loader:
+        X, y = X.to(device), y.to(device)
+        logits, _ = model(X)
+        loss = criterion(logits, y)
+        total_loss += loss.item() * len(y)
+        correct    += (logits.argmax(1) == y).sum().item()
+        n          += len(y)
+        probs = torch.softmax(logits, dim=1)[:, 1]
+        all_probs.extend(probs.cpu().tolist())
+        all_labels.extend(y.cpu().tolist())
+    auroc = compute_auroc(all_probs, all_labels)
+    return total_loss / n, correct / n, auroc
+
+
+def compute_auroc(probs, labels):
+    """Simple Mann-Whitney AUROC — no sklearn needed."""
+    pos = [p for p, l in zip(probs, labels) if l == 1]
+    neg = [p for p, l in zip(probs, labels) if l == 0]
+    if not pos or not neg:
+        return float("nan")
+    count = sum(1 for p in pos for n in neg if p > n) + \
+            0.5 * sum(1 for p in pos for n in neg if p == n)
+    return count / (len(pos) * len(neg))
+
+
+def train(data_dir: str):
+    print(f"Device: {DEVICE}")
+    print("Building dataset from CHB-MIT Subject 01...")
+
+    windows, labels = build_chb01_dataset(data_dir)
+    dataset = EEGDataset(windows, labels)
+
+    n_val   = int(len(dataset) * VAL_SPLIT)
+    n_train = len(dataset) - n_val
+    train_ds, val_ds = random_split(
+        dataset, [n_train, n_val],
+        generator=torch.Generator().manual_seed(42)
+    )
+
+    sampler     = EEGDataset(
+        windows[train_ds.indices], labels[train_ds.indices]
+    ).get_sampler()
+    loss_weights = EEGDataset(
+        windows[train_ds.indices], labels[train_ds.indices]
+    ).get_loss_weights(DEVICE)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=BATCH_SIZE, sampler=sampler
+    )
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+
+    model     = NeuroTransformer().to(DEVICE)
+    criterion = nn.CrossEntropyLoss(weight=loss_weights)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=EPOCHS
+    )
+
+    print(f"\nModel parameters: {model.count_parameters():,}")
+    print(f"Train windows   : {n_train}")
+    print(f"Val windows     : {n_val}")
+    print(f"Loss weights    : interictal={loss_weights[0]:.4f}, "
+          f"ictal={loss_weights[1]:.4f}\n")
+
+    best_auroc = 0.0
+    for epoch in range(1, EPOCHS + 1):
+        tr_loss, tr_acc = train_epoch(
+            model, train_loader, optimizer, criterion, DEVICE
+        )
+        vl_loss, vl_acc, auroc = eval_epoch(
+            model, val_loader, criterion, DEVICE
+        )
+        scheduler.step()
+
+        print(f"Epoch {epoch:3d}/{EPOCHS} | "
+              f"train loss={tr_loss:.4f} acc={tr_acc:.3f} | "
+              f"val loss={vl_loss:.4f} acc={vl_acc:.3f} | "
+              f"AUROC={auroc:.4f}")
+
+        if not np.isnan(auroc) and auroc > best_auroc:
+            best_auroc = auroc
+            torch.save(model.state_dict(), SAVE_PATH)
+            print(f"  ↑ Best model saved (AUROC={best_auroc:.4f})")
+
+    print(f"\nTraining complete. Best AUROC: {best_auroc:.4f}")
+    print(f"Saved to: {SAVE_PATH}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--data_dir", default="./data/chb01",
+        help="Path to CHB-MIT Subject 01 .edf files"
+    )
+    args = parser.parse_args()
+    train(args.data_dir)
