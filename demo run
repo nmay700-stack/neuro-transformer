@@ -13,6 +13,8 @@ What this script proves
 3. Weighted CrossEntropyLoss converges on distinguishable synthetic signals
 4. get_attention_maps() returns (B, 22, 22) tensors suitable for heatmaps
 5. AUROC reaches 1.0 on synthetic data within 5 epochs (CPU-friendly)
+6. Trained model weights saved to trained_model.pt for heatmap extraction
+7. Real attention arrays exported to attention_ictal.npy / attention_interictal.npy
 
 Synthetic signal design
 -----------------------
@@ -27,12 +29,11 @@ Once this passes, swap in real CHB-MIT data via:
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.metrics import roc_auc_score
-
-from model      import build_model
-from data_utils import EEGDataset, make_loader
+import os
 
 # ── Reproducibility ───────────────────────────────────────────────────────────
 SEED = 42
@@ -49,6 +50,160 @@ BATCH_SIZE   = 32
 N_EPOCHS     = 5
 LR           = 1e-3
 
+CHANNEL_NAMES = [
+    "FP1-F7", "F7-T7",  "T7-P7",    "P7-O1",
+    "FP1-F3", "F3-C3",  "C3-P3",    "P3-O1",
+    "FP2-F4", "F4-C4",  "C4-P4",    "P4-O2",
+    "FP2-F8", "F8-T8",  "T8-P8",    "P8-O2",
+    "FZ-CZ",  "CZ-PZ",  "P7-T7",    "T7-FT9",
+    "FT9-FT10","FT10-T8",
+]
+
+
+# ── Minimal self-contained model (no external model.py needed for demo) ───────
+
+class ChannelEmbedding(nn.Module):
+    """Conv1D tokeniser: (B, C, T) -> (B, C, d_model)"""
+    def __init__(self, n_timepoints: int = 256, d_model: int = 88):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(1, 32, kernel_size=8, stride=4),
+            nn.GELU(),
+            nn.Conv1d(32, 64, kernel_size=4, stride=2),
+            nn.GELU(),
+        )
+        # Compute flattened size after convolutions
+        dummy = torch.zeros(1, 1, n_timepoints)
+        flat  = self.conv(dummy).flatten(1).shape[1]
+        self.proj = nn.Linear(flat, d_model)
+
+    def forward(self, x):
+        # x: (B, C, T)
+        B, C, T = x.shape
+        x = x.reshape(B * C, 1, T)
+        x = self.conv(x).flatten(1)
+        x = self.proj(x)
+        return x.reshape(B, C, -1)     # (B, C, d_model)
+
+
+class NeuroTransformerEncoder(nn.Module):
+    """
+    Channel-tokenised Transformer Encoder for EEG seizure onset detection.
+
+    Input  : X ∈ R^{B × C × T}   (B=batch, C=22 channels, T=256 time steps)
+    Embed  : Z_0 = Conv1d(X) ∈ R^{B × C × d_model}   (spatial tokenisation)
+    Encode : Z_L = TransformerEncoder(Z_0 + pos_enc)
+    Classify: y_hat = MLP(MeanPool(Z_L))
+    """
+    def __init__(
+        self,
+        n_channels:  int = 22,
+        n_timepoints:int = 256,
+        d_model:     int = 88,
+        n_heads:     int = 22,
+        n_layers:    int = 2,
+        d_ff:        int = 176,
+        dropout:     float = 0.1,
+        n_classes:   int = 2,
+    ):
+        super().__init__()
+        self.embedding   = ChannelEmbedding(n_timepoints, d_model)
+        self.pos_enc     = nn.Parameter(torch.randn(1, n_channels, d_model) * 0.02)
+        encoder_layer    = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
+            dropout=dropout, batch_first=True, norm_first=True,  # Pre-LN
+        )
+        self.encoder     = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.norm        = nn.LayerNorm(d_model)
+        self.classifier  = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(0.15),
+            nn.Linear(d_model // 2, n_classes),
+        )
+        self._attn_maps  = []   # populated by get_attention_maps()
+
+    def forward(self, x):
+        # x: (B, C, T)
+        z = self.embedding(x) + self.pos_enc          # (B, C, d_model)
+        z = self.encoder(z)                            # (B, C, d_model)
+        z = self.norm(z)
+        pooled  = z.mean(dim=1)                        # (B, d_model)
+        logits  = self.classifier(pooled)              # (B, n_classes)
+        return logits, None
+
+    @torch.no_grad()
+    def get_attention_maps(self, x):
+        """
+        Extract real multi-head self-attention weight matrices from every
+        encoder layer.
+
+        Returns
+        -------
+        logits    : (B, n_classes)
+        attn_maps : list of (B, C, C) tensors, one per encoder layer
+
+        The final-layer attention map A ∈ R^{B × 22 × 22} is a learned
+        electrode connectivity graph. During ictal windows, elevated weights
+        between specific electrode pairs (e.g. F7-T7, T7-P7) reflect the
+        spatial propagation of seizure activity — directly readable as a
+        functional connectivity map without any post-hoc source localisation.
+        """
+        self.eval()
+        z = self.embedding(x) + self.pos_enc          # (B, C, d_model)
+
+        attn_maps = []
+        hidden    = z
+        for layer in self.encoder.layers:
+            # Use PyTorch's built-in need_weights=True path
+            attn_out, attn_w = layer.self_attn(
+                hidden, hidden, hidden, need_weights=True, average_attn_weights=True
+            )
+            # attn_w: (B, C, C) — averaged over heads
+            attn_maps.append(attn_w)
+
+            # Complete the rest of the Pre-LN layer manually
+            hidden = hidden + attn_out
+            hidden = hidden + layer.linear2(
+                layer.dropout(layer.activation(layer.linear1(layer.norm2(hidden))))
+            )
+            hidden = layer.norm1(hidden)
+
+        z      = self.norm(hidden)
+        pooled = z.mean(dim=1)
+        logits = self.classifier(pooled)
+        return logits, attn_maps
+
+
+def build_model(**kwargs) -> NeuroTransformerEncoder:
+    return NeuroTransformerEncoder(**kwargs)
+
+
+# ── Dataset & DataLoader ──────────────────────────────────────────────────────
+
+class EEGDataset(Dataset):
+    def __init__(self, windows: np.ndarray, labels: np.ndarray):
+        self.X = torch.from_numpy(windows)
+        self.y = torch.from_numpy(labels)
+
+    def __len__(self):  return len(self.y)
+    def __getitem__(self, i): return self.X[i], self.y[i]
+
+
+def make_loader(X, y, batch_size, train=True):
+    ds = EEGDataset(X, y)
+    if train:
+        counts  = np.bincount(y)
+        weights = 1.0 / counts[y]
+        sampler = WeightedRandomSampler(
+            torch.from_numpy(weights).float(),
+            num_samples=len(y), replacement=True
+        )
+        return DataLoader(ds, batch_size=batch_size, sampler=sampler)
+    return DataLoader(ds, batch_size=batch_size, shuffle=False)
+
+
+# ── Synthetic data ────────────────────────────────────────────────────────────
 
 def make_synthetic_eeg(
     n_interictal=N_INTERICTAL, n_ictal=N_ICTAL,
@@ -83,13 +238,18 @@ def make_synthetic_eeg(
     return windows[idx], labels[idx]
 
 
+# ── Loss ──────────────────────────────────────────────────────────────────────
+
 def build_weighted_loss(labels: np.ndarray, device: torch.device) -> nn.CrossEntropyLoss:
     """
     Inverse-frequency weighted CrossEntropyLoss.
 
+        w_c = N / (K * n_c)
+
+    where N = total windows, K = number of classes, n_c = count of class c.
     With 2000:20 imbalance, ictal class weight ≈ 100×.
-    A missed seizure is treated as ~100× more costly than a false alarm —
-    appropriate for clinical monitoring where missed seizures can be life-threatening.
+    A missed seizure is penalised ~100× more than a false alarm — appropriate
+    for clinical monitoring where missed seizures can be life-threatening.
     """
     counts  = np.bincount(labels)
     weights = len(labels) / (len(counts) * counts.astype(float))
@@ -99,6 +259,8 @@ def build_weighted_loss(labels: np.ndarray, device: torch.device) -> nn.CrossEnt
         label_smoothing = 0.05,
     )
 
+
+# ── Training helpers ──────────────────────────────────────────────────────────
 
 def train_epoch(model, loader, optimiser, criterion, device):
     model.train()
@@ -141,20 +303,54 @@ def evaluate(model, loader, criterion, device):
     return total_loss / total, correct / total, auroc
 
 
+# ── Real attention export ─────────────────────────────────────────────────────
+
+def export_attention_arrays(model, windows, labels, device, save_dir="."):
+    """
+    Extract and save REAL attention weight matrices from the trained model.
+
+    Saves
+    -----
+    attention_ictal.npy        : mean (22, 22) over all ictal windows
+    attention_interictal.npy   : mean (22, 22) over 50 interictal windows
+    top_pairs_ictal.txt        : top-10 attended electrode pairs during ictal
+
+    These arrays are used directly by generate_heatmap.py — no simulation.
+    """
+    model.eval()
+    ictal_idx      = np.where(labels == 1)[0]
+    interictal_idx = np.where(labels == 0)[0][:50]   # sample 50 for speed
+
+    def _get_mean_attn(idx):
+        x            = torch.from_numpy(windows[idx]).to(device)
+        _, attn_maps = model.get_attention_maps(x)
+        last         = attn_maps[-1].cpu().numpy()    # (N, 22, 22)
+        mean_attn    = last.mean(axis=0)              # (22, 22)
+        np.fill_diagonal(mean_attn, 0)                # zero self-correlation
+        return mean_attn / (mean_attn.max() + 1e-8)
+
+    ictal_attn      = _get_mean_attn(ictal_idx)
+    interictal_attn = _get_mean_attn(interictal_idx)
+
+    np.save(os.path.join(save_dir, "attention_ictal.npy"),      ictal_attn)
+    np.save(os.path.join(save_dir, "attention_interictal.npy"), interictal_attn)
+    print(f"  ✓ Real attention arrays saved to {save_dir}/")
+
+    # Print top-10 pairs
+    flat   = ictal_attn.copy()
+    top10  = np.dstack(np.unravel_index(np.argsort(flat.ravel())[-10:], flat.shape))[0][::-1]
+    lines  = ["Top-10 electrode pairs by ictal attention weight:\n"]
+    for src, tgt in top10:
+        lines.append(f"  {CHANNEL_NAMES[src]:12s} → {CHANNEL_NAMES[tgt]:12s}  "
+                     f"(attn={flat[src, tgt]:.4f})\n")
+    txt_path = os.path.join(save_dir, "top_pairs_ictal.txt")
+    with open(txt_path, "w") as f:
+        f.writelines(lines)
+    print("".join(lines))
+
+
 def demo_attention(model, windows, labels, device, n_ictal: int = 3):
-    """
-    Print top-3 attended electrode pairs for ictal windows.
-    The (22×22) attention matrix = learned functional connectivity graph.
-    Elevated T7↔F7 attention during ictal prediction matches known MTLE pathways.
-    """
-    CHANNEL_NAMES = [
-        "FP1-F7", "F7-T7",  "T7-P7",    "P7-O1",
-        "FP1-F3", "F3-C3",  "C3-P3",    "P3-O1",
-        "FP2-F4", "F4-C4",  "C4-P4",    "P4-O2",
-        "FP2-F8", "F8-T8",  "T8-P8",    "P8-O2",
-        "FZ-CZ",  "CZ-PZ",  "P7-T7",    "T7-FT9",
-        "FT9-FT10","FT10-T8",
-    ]
+    """Print top-3 attended electrode pairs for ictal windows (quick preview)."""
     model.eval()
     ictal_idx = np.where(labels == 1)[0][:n_ictal]
     x = torch.from_numpy(windows[ictal_idx]).to(device)
@@ -163,7 +359,7 @@ def demo_attention(model, windows, labels, device, n_ictal: int = 3):
 
     print("\n── Attention Heatmap Preview (final encoder layer, ictal windows) ──")
     for i in range(len(ictal_idx)):
-        attn = last_layer_attn[i]
+        attn = last_layer_attn[i].copy()
         np.fill_diagonal(attn, 0)
         top_pairs = np.dstack(np.unravel_index(
             np.argsort(attn.ravel())[-3:], attn.shape
@@ -174,15 +370,18 @@ def demo_attention(model, windows, labels, device, n_ictal: int = 3):
                   f"(attn={attn[src, tgt]:.4f})")
 
 
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
     device = (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
 
     print("=" * 60)
-    print("  Neuro-Transformer  |  Synthetic EEG Demo")
+    print("  NeuroTransformer  |  Synthetic EEG Demo")
     print(f"  Device: {device}")
     print("=" * 60)
 
-    print(f"\n[1/4] Generating synthetic EEG  "
+    # ── 1. Data ───────────────────────────────────────────────────────────────
+    print(f"\n[1/5] Generating synthetic EEG  "
           f"({N_INTERICTAL} interictal  +  {N_ICTAL} ictal windows)")
     windows, labels = make_synthetic_eeg()
     print(f"      Shape: {windows.shape}  |  "
@@ -194,7 +393,8 @@ def main():
     train_loader = make_loader(X_train, y_train, BATCH_SIZE, train=True)
     val_loader   = make_loader(X_val,   y_val,   BATCH_SIZE, train=False)
 
-    print("\n[2/4] Building NeuroTransformerEncoder …")
+    # ── 2. Model ──────────────────────────────────────────────────────────────
+    print("\n[2/5] Building NeuroTransformerEncoder …")
     model    = build_model().to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"      Parameters: {n_params:,}")
@@ -203,7 +403,8 @@ def main():
     optimiser = AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimiser, T_max=N_EPOCHS, eta_min=1e-5)
 
-    print(f"\n[3/4] Training for {N_EPOCHS} epochs …\n")
+    # ── 3. Training ───────────────────────────────────────────────────────────
+    print(f"\n[3/5] Training for {N_EPOCHS} epochs …\n")
     print(f"  {'Epoch':>5}  {'Train Loss':>10}  {'Train Acc':>9}  "
           f"{'Val Loss':>8}  {'Val Acc':>7}  {'AUROC':>6}")
     print("  " + "─" * 55)
@@ -215,13 +416,27 @@ def main():
         print(f"  {epoch:>5}  {tr_loss:>10.4f}  {tr_acc*100:>8.1f}%  "
               f"{vl_loss:>8.4f}  {vl_acc*100:>6.1f}%  {auroc:>6.4f}")
 
-    print("\n[4/4] Inspecting attention maps …")
+    # ── 4. Save model weights ─────────────────────────────────────────────────
+    print("\n[4/5] Saving trained model weights …")
+    torch.save(model.state_dict(), "trained_model.pt")
+    print("      ✓ Saved → trained_model.pt")
+
+    # ── 5. Export real attention arrays ──────────────────────────────────────
+    print("\n[5/5] Extracting and exporting real attention maps …")
     demo_attention(model, windows, labels, device, n_ictal=3)
+    export_attention_arrays(model, windows, labels, device, save_dir=".")
 
     print("\n" + "=" * 60)
     print("  ✓  Demo complete. Pipeline verified.")
-    print("  Next: swap synthetic data for real .edf files via")
-    print("        data_utils.process_subject('data/chb-mit/chb01/', 'chb01')")
+    print("  ✓  trained_model.pt    — load for inference")
+    print("  ✓  attention_ictal.npy — real 22×22 attention matrix")
+    print("  ✓  attention_interictal.npy")
+    print("  ✓  top_pairs_ictal.txt — top electrode pair ranking")
+    print()
+    print("  Next steps:")
+    print("  1. Run generate_heatmap.py  → publication figure (real weights)")
+    print("  2. Swap synthetic data for real CHB-MIT .edf files via:")
+    print("     data_utils.process_subject('data/chb-mit/chb01/', 'chb01')")
     print("=" * 60)
 
 
